@@ -1,0 +1,122 @@
+#!/bin/sh
+set -eu
+
+apps=""
+seen_imgs=","
+version_id=""
+
+cgroup_slice=""
+if [ -d /sys/fs/cgroup/system.slice ]; then
+    cgroup_slice="/sys/fs/cgroup/system.slice"
+elif [ -d /sys/fs/cgroup/systemd/system.slice ]; then
+    cgroup_slice="/sys/fs/cgroup/systemd/system.slice"
+fi
+
+stage1_root="$(stat -Lc '%d:%i' / 2>/dev/null || true)"
+
+if [ -n "$cgroup_slice" ]; then
+    for unit_dir in "${cgroup_slice}"/*.service; do
+        if [ ! -d "$unit_dir" ]; then
+            continue
+        fi
+        unit_name="${unit_dir##*/}"
+        case "$unit_name" in
+            dbus.service|systemd-*|container-*|pod-os-release-*|run-*.service) continue ;;
+        esac
+
+        pid=""
+        if [ -r "${unit_dir}/cgroup.procs" ]; then
+            IFS= read -r pid < "${unit_dir}/cgroup.procs" || true
+        fi
+        if [ -z "$pid" ] || [ ! -e "/proc/${pid}/root" ]; then
+            continue
+        fi
+
+        proc_root="$(stat -Lc '%d:%i' "/proc/${pid}/root" 2>/dev/null || true)"
+        if [ -z "$proc_root" ] || [ "$proc_root" = "$stage1_root" ]; then
+            continue
+        fi
+
+        app_id=""
+        cand="${unit_name%.service}"
+        if [ -d "/opt/stage2/${cand}/rootfs" ]; then
+            cand_root="$(stat -Lc '%d:%i' "/opt/stage2/${cand}/rootfs" 2>/dev/null || true)"
+            if [ "$cand_root" = "$proc_root" ]; then
+                app_id="$cand"
+            fi
+        fi
+
+        if [ -z "$app_id" ]; then
+            for stage2_dir in /opt/stage2/*/rootfs; do
+                if [ ! -d "$stage2_dir" ]; then
+                    continue
+                fi
+                cand_root="$(stat -Lc '%d:%i' "$stage2_dir" 2>/dev/null || true)"
+                if [ "$cand_root" = "$proc_root" ]; then
+                    tmp="${stage2_dir#/opt/stage2/}"
+                    app_id="${tmp%/rootfs}"
+                    break
+                fi
+            done
+        fi
+
+        if [ -z "$app_id" ]; then
+            continue
+        fi
+
+        root_dir="/opt/stage2/${app_id}/rootfs"
+        if [ -f "/opt/stage2/${app_id}/image" ]; then
+            img_name="$(tr -d ' \t\r\n' < "/opt/stage2/${app_id}/image")"
+        else
+            img_name="$app_id"
+        fi
+
+        case "$seen_imgs" in
+            *,"${img_name}",*) ;;
+            *)
+                seen_imgs="${seen_imgs}${img_name},"
+                if [ -z "$apps" ]; then
+                    apps="$img_name"
+                else
+                    apps="${apps},${img_name}"
+                fi
+                ;;
+        esac
+
+        if [ -z "$version_id" ] && [ -f "${root_dir}/etc/os-release" ]; then
+            version_id="$(sed -n 's/^VERSION_ID=//p' "${root_dir}/etc/os-release" | tr -d '"' | head -n 1)"
+        fi
+    done
+fi
+
+pretty_name="Debian GNU/Linux"
+os_name="Debian GNU/Linux"
+if [ -f /usr/lib/os-release ]; then
+    p="$(sed -n 's/^PRETTY_NAME=//p' /usr/lib/os-release | tr -d '"' | head -n 1)"
+    n="$(sed -n 's/^NAME=//p' /usr/lib/os-release | tr -d '"' | head -n 1)"
+    if [ -n "$p" ]; then
+        pretty_name="$p"
+    fi
+    if [ -n "$n" ]; then
+        os_name="$n"
+    fi
+fi
+
+if [ -n "$apps" ]; then
+    cat > /etc/os-release.tmp << EOR
+PRETTY_NAME="${pretty_name}"
+NAME="${os_name}"
+ID="${apps}"
+VERSION_ID="${version_id}"
+EOR
+    mv -f /etc/os-release.tmp /etc/os-release
+elif [ -f /usr/lib/os-release ]; then
+    cp /usr/lib/os-release /etc/os-release.tmp
+    mv -f /etc/os-release.tmp /etc/os-release
+else
+    cat > /etc/os-release.tmp << EOR
+PRETTY_NAME="${pretty_name}"
+NAME="${os_name}"
+EOR
+    mv -f /etc/os-release.tmp /etc/os-release
+fi

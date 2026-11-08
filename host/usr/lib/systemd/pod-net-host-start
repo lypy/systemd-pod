@@ -1,0 +1,5 @@
+#!/bin/sh
+set -eu
+
+export NSPAWN_NET_ARGS=""
+exec /usr/lib/systemd/pod-container-start

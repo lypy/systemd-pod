@@ -1,0 +1,11 @@
+#!/bin/sh
+set -eu
+
+SELF_NETNS="$(readlink /proc/self/ns/net)"
+HOST_NETNS="$(readlink /proc/1/ns/net)"
+
+if [ "$SELF_NETNS" != "$HOST_NETNS" ]; then
+    exec /usr/lib/systemd/pod-net-vlan-start
+else
+    exec /usr/lib/systemd/pod-net-host-start
+fi

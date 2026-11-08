@@ -1,0 +1,8 @@
+[Unit]
+Description=Synchronise Stage 2 image metadata to Stage 1 /etc/os-release
+DefaultDependencies=no
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/systemd/pod-os-release-sync
