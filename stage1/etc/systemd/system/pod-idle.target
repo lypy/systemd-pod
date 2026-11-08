@@ -1,0 +1,5 @@
+[Unit]
+Description=Idle Pod Supervisor Target
+DefaultDependencies=no
+Wants=systemd-journald.socket systemd-journald-dev-log.socket systemd-journald.service dbus.socket dbus.service pod-os-release-sync.path
+After=systemd-journald.socket systemd-journald-dev-log.socket systemd-journald.service dbus.socket dbus.service

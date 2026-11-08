@@ -1,0 +1,252 @@
+#!/bin/sh
+set -eu
+
+CRED_DIR="${CREDENTIALS_DIRECTORY:-/run/credentials}"
+RUN_DIR="${RUNTIME_DIRECTORY:-}"
+
+if [ -z "$RUN_DIR" ] || [ ! -f "${RUN_DIR}/machine-name" ]; then
+    echo "Missing machine-name in RUNTIME_DIRECTORY" > /dev/stderr
+    exit 1
+fi
+
+MACHINE_NAME="$(tr -d ' \t\r\n' < "${RUN_DIR}/machine-name")"
+
+is_file_bind_src() {
+    bind_src="$1"
+    if [ -f "${RUN_DIR}/stage1-upper${bind_src}" ] || [ -f "/var/lib/machines/stage1-debian${bind_src}" ]; then
+        return 0
+    fi
+    if [ -d "${RUN_DIR}/stage1-upper${bind_src}" ] || [ -d "/var/lib/machines/stage1-debian${bind_src}" ]; then
+        return 1
+    fi
+    case "$bind_src" in
+        /vol/*)
+            vol_rel="${bind_src#/vol/}"
+            if [ -f "${RUN_DIR}/vol/${vol_rel}" ]; then
+                return 0
+            fi
+            if [ -d "${RUN_DIR}/vol/${vol_rel}" ]; then
+                return 1
+            fi
+            ;;
+    esac
+    if [ -f "$bind_src" ]; then
+        return 0
+    fi
+    return 1
+}
+
+start_app_cred() {
+    cred="$1"
+    pass="$2"
+    app_id="${cred##*pod.app.}"
+    spec="$(tr -d '\r\n' < "$cred")"
+
+    image_name=""
+    exec_cmd=""
+    has_after=0
+    has_user=0
+    has_group=0
+    has_wd=0
+    has_caps=0
+    set --
+
+    case "$spec" in
+        *=*)
+            old_ifs="$IFS"
+            IFS=','
+            for pair in $spec; do
+                k="${pair%%=*}"
+                v="${pair#*=}"
+                case "$k" in
+                    image)
+                        image_name="$v"
+                        ;;
+                    exec)
+                        exec_cmd="$v"
+                        ;;
+                    bind)
+                        set -- "$@" --property="BindPaths=${v}"
+                        ;;
+                    bind_ro)
+                        set -- "$@" --property="BindReadOnlyPaths=${v}"
+                        ;;
+                    after)
+                        has_after=1
+                        set -- "$@" --property="After=${v}"
+                        ;;
+                    user)
+                        has_user=1
+                        set -- "$@" --property="User=${v}"
+                        ;;
+                    group)
+                        has_group=1
+                        set -- "$@" --property="Group=${v}"
+                        ;;
+                    sup_groups)
+                        set -- "$@" --property="SupplementaryGroups=${v}"
+                        ;;
+                    caps)
+                        has_caps=1
+                        set -- "$@" --property="CapabilityBoundingSet=${v}"
+                        ;;
+                    ambient_caps)
+                        set -- "$@" --property="AmbientCapabilities=${v}"
+                        ;;
+                    exec_pre)
+                        set -- "$@" --property="ExecStartPre=${v}"
+                        ;;
+                    exec_post)
+                        set -- "$@" --property="ExecStartPost=${v}"
+                        ;;
+                    exec_stop)
+                        set -- "$@" --property="ExecStopPost=${v}"
+                        ;;
+                    memory_max)
+                        set -- "$@" --property="MemoryMax=${v}"
+                        ;;
+                    memory_high)
+                        set -- "$@" --property="MemoryHigh=${v}"
+                        ;;
+                    cpu_quota)
+                        set -- "$@" --property="CPUQuota=${v}"
+                        ;;
+                    cpu_weight)
+                        set -- "$@" --property="CPUWeight=${v}"
+                        ;;
+                    tasks_max)
+                        set -- "$@" --property="TasksMax=${v}"
+                        ;;
+                    syscall_filter)
+                        set -- "$@" --property="SystemCallFilter=${v}"
+                        ;;
+                    env)
+                        set -- "$@" --property="Environment=${v}"
+                        ;;
+                    wd)
+                        has_wd=1
+                        set -- "$@" --property="WorkingDirectory=${v}"
+                        ;;
+                esac
+            done
+            IFS="$old_ifs"
+            ;;
+        *)
+            image_name="$(printf '%s' "$spec" | tr -d ' \t')"
+            ;;
+    esac
+
+    if [ "$pass" -eq 1 ] && [ "$has_after" -eq 1 ]; then
+        return 0
+    fi
+    if [ "$pass" -eq 2 ] && [ "$has_after" -eq 0 ]; then
+        return 0
+    fi
+
+    if [ -z "$image_name" ]; then
+        echo "Missing image name in ${cred}" > /dev/stderr
+        exit 1
+    fi
+
+    img_dir="/var/lib/machines/${image_name}"
+
+    if [ -z "$exec_cmd" ]; then
+        entrypoint_file="${img_dir}/etc/pod-entrypoint"
+        if [ -f "$entrypoint_file" ]; then
+            exec_cmd="$(tr -d '\r\n' < "$entrypoint_file")"
+        else
+            echo "No exec= specified in ${cred} and no /etc/pod-entrypoint found in ${img_dir}" > /dev/stderr
+            exit 1
+        fi
+    fi
+
+    if [ "$has_user" -eq 0 ] && [ -f "${img_dir}/etc/pod-user" ]; then
+        img_user="$(tr -d ' \t\r\n' < "${img_dir}/etc/pod-user")"
+        if [ -n "$img_user" ]; then
+            set -- "$@" --property="User=${img_user}"
+        fi
+    fi
+
+    if [ "$has_group" -eq 0 ] && [ -f "${img_dir}/etc/pod-group" ]; then
+        img_group="$(tr -d ' \t\r\n' < "${img_dir}/etc/pod-group")"
+        if [ -n "$img_group" ]; then
+            set -- "$@" --property="Group=${img_group}"
+        fi
+    fi
+
+    if [ "$has_wd" -eq 0 ] && [ -f "${img_dir}/etc/pod-wd" ]; then
+        img_wd="$(tr -d ' \t\r\n' < "${img_dir}/etc/pod-wd")"
+        if [ -n "$img_wd" ]; then
+            set -- "$@" --property="WorkingDirectory=${img_wd}"
+        fi
+    fi
+
+    if [ "$has_caps" -eq 0 ] && [ -f "${img_dir}/etc/pod-caps" ]; then
+        img_caps="$(tr -d '\r\n' < "${img_dir}/etc/pod-caps")"
+        if [ -n "$img_caps" ]; then
+            set -- "$@" --property="CapabilityBoundingSet=${img_caps}"
+        fi
+    fi
+
+    if [ -f "${img_dir}/etc/pod-environment" ]; then
+        while IFS= read -r env_line || [ -n "$env_line" ]; do
+            env_line="$(printf '%s' "$env_line" | tr -d '\r')"
+            case "$env_line" in
+                ""|\#*) continue ;;
+                *=*) set -- "$@" --property="Environment=${env_line}" ;;
+            esac
+        done < "${img_dir}/etc/pod-environment"
+    fi
+
+    app_upper="${RUN_DIR}/app-upper/${app_id}"
+    if [ -d "$app_upper" ]; then
+        case "$spec" in
+            *=*)
+                old_ifs="$IFS"
+                IFS=','
+                for pair in $spec; do
+                    k="${pair%%=*}"
+                    v="${pair#*=}"
+                    case "$k" in
+                        bind|bind_ro)
+                            src="${v%%:*}"
+                            dst="${v#*:}"
+                            dst="${dst%%:*}"
+                            if [ -n "$dst" ]; then
+                                if [ -f "${app_upper}${dst}" ] || [ -f "${img_dir}${dst}" ] || is_file_bind_src "$src"; then
+                                    mkdir -p "${app_upper}${dst%/*}"
+                                    if [ ! -f "${img_dir}${dst}" ]; then
+                                        touch "${app_upper}${dst}"
+                                    fi
+                                else
+                                    mkdir -p "${app_upper}${dst}"
+                                fi
+                            fi
+                            ;;
+                    esac
+                done
+                IFS="$old_ifs"
+                ;;
+        esac
+    fi
+
+    # shellcheck disable=SC2086
+    /usr/bin/systemd-run --machine="${MACHINE_NAME}" \
+        --collect \
+        --unit="${app_id}.service" \
+        --property=Restart=always \
+        --property=RestartSec=2s \
+        --property=MountAPIVFS=yes \
+        --property="RootDirectory=/opt/stage2/${app_id}/rootfs" \
+        "$@" \
+        $exec_cmd
+}
+
+for pass in 1 2; do
+    for cred in "${CRED_DIR}"/pod.app.*; do
+        if [ ! -f "$cred" ]; then
+            continue
+        fi
+        start_app_cred "$cred" "$pass"
+    done
+done

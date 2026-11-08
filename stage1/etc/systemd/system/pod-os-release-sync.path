@@ -1,0 +1,7 @@
+[Unit]
+Description=Monitor transient Stage 2 units for os-release sync
+DefaultDependencies=no
+
+[Path]
+PathChanged=/run/systemd/transient
+Unit=pod-os-release-sync.service

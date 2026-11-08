@@ -1,0 +1,279 @@
+#!/bin/sh
+set -eu
+
+CRED_DIR="${CREDENTIALS_DIRECTORY:-/run/credentials}"
+
+# 1. Resolve or generate dynamic UUID and identifiers
+if [ -n "${POD_UUID:-}" ]; then
+    POD_UUID="${POD_UUID#pod-}"
+elif [ -f "${CRED_DIR}/pod.uuid" ]; then
+    POD_UUID="$(tr -d ' \t\r\n' < "${CRED_DIR}/pod.uuid")"
+    POD_UUID="${POD_UUID#pod-}"
+else
+    POD_UUID="$(systemd-id128 new --uuid)"
+fi
+
+MACHINE_NAME="pod-${POD_UUID}"
+POD_MACHINE_ID="$(printf '%s' "${POD_UUID}" | tr -d '-' | tr '[:upper:]' '[:lower:]')"
+
+if [ -f "${CRED_DIR}/pod.hostname" ]; then
+    POD_HOSTNAME="$(tr -d ' \t\r\n' < "${CRED_DIR}/pod.hostname")"
+else
+    POD_HOSTNAME="${MACHINE_NAME}"
+fi
+
+RUN_DIR="${RUNTIME_DIRECTORY:-/run/pods/${POD_UUID}}"
+mkdir -p -m 0755 "${RUN_DIR}"
+printf '%s\n' "${MACHINE_NAME}" > "${RUN_DIR}/machine-name"
+printf '%s\n' "${POD_UUID}" > "${RUN_DIR}/uuid"
+
+STAGE1_IMAGE="stage1-debian"
+if [ -f "${CRED_DIR}/pod.stage1" ]; then
+    STAGE1_IMAGE="$(tr -d ' \t\r\n' < "${CRED_DIR}/pod.stage1")"
+fi
+
+STAGE1_LOWER="/var/lib/machines/${STAGE1_IMAGE}"
+if [ ! -d "${STAGE1_LOWER}" ]; then
+    echo "Stage 1 image ${STAGE1_IMAGE} not found in /var/lib/machines" > /dev/stderr
+    exit 1
+fi
+
+read_kv() {
+    target_key="$1"
+    kv_string="$2"
+    old_ifs="$IFS"
+    IFS=','
+    for pair in $kv_string; do
+        k="${pair%%=*}"
+        v="${pair#*=}"
+        if [ "$k" = "$target_key" ]; then
+            IFS="$old_ifs"
+            printf '%s' "$v"
+            return 0
+        fi
+    done
+    IFS="$old_ifs"
+    return 1
+}
+
+# 2. Mount a per-pod overlay of Stage 1 so multiple machines share stage1-debian concurrently
+STAGE1_ROOT="${RUN_DIR}/stage1"
+mkdir -p "${STAGE1_ROOT}" "${RUN_DIR}/stage1-upper" "${RUN_DIR}/stage1-work"
+mount -t overlay overlay \
+    -o "lowerdir=${STAGE1_LOWER},upperdir=${RUN_DIR}/stage1-upper,workdir=${RUN_DIR}/stage1-work" \
+    "${STAGE1_ROOT}"
+
+printf '%s\n' "${POD_HOSTNAME}" > "${STAGE1_ROOT}/etc/hostname"
+printf '%s\n' "${POD_MACHINE_ID}" > "${STAGE1_ROOT}/etc/machine-id"
+
+if [ -f "${CRED_DIR}/net.dns" ]; then
+    dns_raw="$(tr -d ' \t\r\n' < "${CRED_DIR}/net.dns")"
+    : > "${STAGE1_ROOT}/etc/resolv.conf"
+    old_ifs="$IFS"
+    IFS=','
+    for srv in $dns_raw; do
+        printf 'nameserver %s\n' "$srv" >> "${STAGE1_ROOT}/etc/resolv.conf"
+    done
+    IFS="$old_ifs"
+else
+    cp /etc/resolv.conf "${STAGE1_ROOT}/etc/resolv.conf"
+fi
+cp "${STAGE1_ROOT}/etc/resolv.conf" "${RUN_DIR}/resolv.conf"
+
+# 3. Provision shared ephemeral empty volumes inside Stage 1 at /vol/<name>
+mkdir -p -m 0755 "${RUN_DIR}/vol" "${STAGE1_ROOT}/vol"
+for cred in "${CRED_DIR}"/vol.*; do
+    if [ ! -f "$cred" ]; then
+        continue
+    fi
+    vol_name="${cred##*vol.}"
+    spec="$(tr -d ' \t\r\n' < "$cred")"
+    mode="$(read_kv mode "$spec" || printf '0755')"
+    uid="$(read_kv uid "$spec" || printf '0')"
+    gid="$(read_kv gid "$spec" || printf '0')"
+    mkdir -p "${RUN_DIR}/vol/${vol_name}"
+    chmod "$mode" "${RUN_DIR}/vol/${vol_name}"
+    chown "${uid}:${gid}" "${RUN_DIR}/vol/${vol_name}"
+done
+
+# 4. Process declarative host bind mounts (host.bind.<name>:src=/path,dst=/path,ro=true)
+#     before Stage 2 app overlays so Stage 2 bind/bind_ro can inspect whether a
+#     /vol/* source path is a file or a directory.
+NSPAWN_HOST_BINDS=""
+for cred in "${CRED_DIR}"/host.bind.*; do
+    if [ ! -f "$cred" ]; then
+        continue
+    fi
+    spec="$(tr -d ' \t\r\n' < "$cred")"
+    src="$(read_kv src "$spec")"
+    dst="$(read_kv dst "$spec")"
+    ro="$(read_kv ro "$spec" || printf 'false')"
+    if [ -d "$src" ]; then
+        mkdir -p "${STAGE1_ROOT}${dst}"
+    else
+        mkdir -p "${STAGE1_ROOT}${dst%/*}"
+        touch "${STAGE1_ROOT}${dst}"
+    fi
+    if [ "$ro" = "true" ]; then
+        NSPAWN_HOST_BINDS="${NSPAWN_HOST_BINDS} --bind-ro=${src}:${dst}"
+    else
+        NSPAWN_HOST_BINDS="${NSPAWN_HOST_BINDS} --bind=${src}:${dst}"
+    fi
+done
+
+is_file_bind_src() {
+    bind_src="$1"
+    if [ -f "${STAGE1_ROOT}${bind_src}" ]; then
+        return 0
+    fi
+    if [ -d "${STAGE1_ROOT}${bind_src}" ]; then
+        return 1
+    fi
+    case "$bind_src" in
+        /vol/*)
+            vol_rel="${bind_src#/vol/}"
+            if [ -f "${RUN_DIR}/vol/${vol_rel}" ]; then
+                return 0
+            fi
+            if [ -d "${RUN_DIR}/vol/${vol_rel}" ]; then
+                return 1
+            fi
+            ;;
+    esac
+    if [ -f "$bind_src" ]; then
+        return 0
+    fi
+    return 1
+}
+
+# 5. Mount each Stage 2 application instance overlay outside STAGE1_ROOT at
+#    ${RUN_DIR}/app-rootfs/<app_id> and pass --bind to systemd-nspawn so
+#    setup_root() does not strip the mount and multiple instances of the same
+#    image each receive an isolated ephemeral OverlayFS.
+NSPAWN_APP_BINDS=""
+mkdir -p "${STAGE1_ROOT}/opt/stage2" "${RUN_DIR}/app-rootfs" "${RUN_DIR}/app-upper" "${RUN_DIR}/app-work"
+
+for cred in "${CRED_DIR}"/pod.app.*; do
+    if [ ! -f "$cred" ]; then
+        continue
+    fi
+    app_id="${cred##*pod.app.}"
+    spec="$(tr -d '\r\n' < "$cred")"
+    case "$spec" in
+        *=*)
+            img_name="$(read_kv image "$spec" || true)"
+            ;;
+        *)
+            img_name="$(printf '%s' "$spec" | tr -d ' \t')"
+            ;;
+    esac
+
+    if [ -z "$img_name" ]; then
+        echo "Missing image name in ${cred}" > /dev/stderr
+        exit 1
+    fi
+
+    img_dir="/var/lib/machines/${img_name}"
+    if [ ! -d "$img_dir" ]; then
+        echo "Stage 2 image ${img_name} not found in /var/lib/machines" > /dev/stderr
+        exit 1
+    fi
+
+    app_merged="${RUN_DIR}/app-rootfs/${app_id}"
+    app_upper="${RUN_DIR}/app-upper/${app_id}"
+    app_work="${RUN_DIR}/app-work/${app_id}"
+    app_target="/opt/stage2/${app_id}/rootfs"
+
+    mkdir -p "${app_merged}" "${app_upper}" "${app_work}" "${STAGE1_ROOT}${app_target}"
+    printf '%s\n' "${img_name}" > "${STAGE1_ROOT}/opt/stage2/${app_id}/image"
+
+    mount -t overlay overlay \
+        -o "lowerdir=${img_dir},upperdir=${app_upper},workdir=${app_work}" \
+        "${app_merged}"
+
+    mkdir -p "${app_merged}/etc" "${app_merged}/proc" "${app_merged}/sys" "${app_merged}/dev" "${app_merged}/run" "${app_merged}/tmp"
+    chmod 1777 "${app_merged}/tmp"
+    cp "${STAGE1_ROOT}/etc/resolv.conf" "${app_merged}/etc/resolv.conf"
+    cp "${STAGE1_ROOT}/etc/hostname" "${app_merged}/etc/hostname"
+
+    case "$spec" in
+        *=*)
+            old_ifs="$IFS"
+            IFS=','
+            for pair in $spec; do
+                k="${pair%%=*}"
+                v="${pair#*=}"
+                case "$k" in
+                    bind|bind_ro)
+                        src="${v%%:*}"
+                        dst="${v#*:}"
+                        dst="${dst%%:*}"
+                        if [ -n "$dst" ]; then
+                            if [ -f "${app_merged}${dst}" ] || is_file_bind_src "$src"; then
+                                mkdir -p "${app_merged}${dst%/*}"
+                                touch "${app_merged}${dst}"
+                            else
+                                mkdir -p "${app_merged}${dst}"
+                            fi
+                        fi
+                        ;;
+                esac
+            done
+            IFS="$old_ifs"
+            ;;
+    esac
+
+    NSPAWN_APP_BINDS="${NSPAWN_APP_BINDS} --bind=${app_merged}:${app_target}"
+done
+
+# 6. Wire journal directory bindings for journalctl -M
+HOST_MACHINE_ID="$(tr -d ' \t\r\n' < /etc/machine-id)"
+NSPAWN_JOURNAL_BINDS=""
+
+nsenter --mount=/proc/1/ns/mnt -- mkdir -p "/run/log/journal/${HOST_MACHINE_ID}.${POD_UUID}"
+mkdir -p "${STAGE1_ROOT}/run/log/journal/${POD_MACHINE_ID}"
+NSPAWN_JOURNAL_BINDS="--bind=/run/log/journal/${HOST_MACHINE_ID}.${POD_UUID}:/run/log/journal/${POD_MACHINE_ID}"
+
+if [ -d /var/log/journal ]; then
+    nsenter --mount=/proc/1/ns/mnt -- mkdir -p "/var/log/journal/${HOST_MACHINE_ID}.${POD_UUID}"
+    mkdir -p "${STAGE1_ROOT}/var/log/journal/${POD_MACHINE_ID}"
+    NSPAWN_JOURNAL_BINDS="${NSPAWN_JOURNAL_BINDS} --bind=/var/log/journal/${HOST_MACHINE_ID}.${POD_UUID}:/var/log/journal/${POD_MACHINE_ID}"
+fi
+
+# 7. Resolve Stage 1 capabilities and disable image lock / seccomp filtering
+POD_CAPS="CAP_NET_RAW,CAP_NET_ADMIN,CAP_NET_BIND_SERVICE,CAP_SYS_ADMIN"
+if [ -f "${CRED_DIR}/pod.caps" ]; then
+    custom_caps="$(tr -d ' \t\r\n' < "${CRED_DIR}/pod.caps")"
+    if [ -n "$custom_caps" ]; then
+        case ",${custom_caps}," in
+            *,CAP_SYS_ADMIN,*)
+                POD_CAPS="$custom_caps"
+                ;;
+            *)
+                POD_CAPS="${custom_caps},CAP_SYS_ADMIN"
+                ;;
+        esac
+    fi
+fi
+
+export SYSTEMD_NSPAWN_LOCK=0
+export SYSTEMD_NSPAWN_SECCOMP=0
+
+# 8. Execute systemd-nspawn with Stage 2 app rootfs bind mounts and configured capabilities
+# shellcheck disable=SC2086
+exec /usr/bin/systemd-nspawn \
+    --quiet \
+    --keep-unit \
+    --boot \
+    --register=yes \
+    --link-journal=no \
+    --capability="${POD_CAPS}" \
+    --machine="${MACHINE_NAME}" \
+    --hostname="${POD_HOSTNAME}" \
+    --uuid="${POD_MACHINE_ID}" \
+    --directory="${STAGE1_ROOT}" \
+    --bind="${RUN_DIR}/vol:/vol" \
+    $NSPAWN_APP_BINDS \
+    $NSPAWN_HOST_BINDS \
+    $NSPAWN_JOURNAL_BINDS \
+    ${NSPAWN_NET_ARGS:-}

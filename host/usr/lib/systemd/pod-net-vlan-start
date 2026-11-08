@@ -1,0 +1,78 @@
+#!/bin/sh
+set -eu
+
+CRED_DIR="${CREDENTIALS_DIRECTORY:-/run/credentials}"
+
+if [ -f "${CRED_DIR}/pod.uuid" ]; then
+    POD_UUID="$(tr -d ' \t\r\n' < "${CRED_DIR}/pod.uuid")"
+    POD_UUID="${POD_UUID#pod-}"
+else
+    POD_UUID="$(systemd-id128 new --uuid)"
+fi
+export POD_UUID
+
+read_kv() {
+    target_key="$1"
+    kv_string="$2"
+    old_ifs="$IFS"
+    IFS=','
+    for pair in $kv_string; do
+        k="${pair%%=*}"
+        v="${pair#*=}"
+        if [ "$k" = "$target_key" ]; then
+            IFS="$old_ifs"
+            printf '%s' "$v"
+            return 0
+        fi
+    done
+    IFS="$old_ifs"
+    return 1
+}
+
+SELF_NETNS="$(readlink /proc/self/ns/net)"
+HOST_NETNS="$(readlink /proc/1/ns/net)"
+
+if [ "$SELF_NETNS" = "$HOST_NETNS" ]; then
+    echo "pod-net-vlan-start requires PrivateNetwork=yes on the pod service unit" > /dev/stderr
+    exit 1
+fi
+
+nsenter --mount=/proc/1/ns/mnt -- mkdir -p /run/netns
+nsenter --mount=/proc/1/ns/mnt -- touch "/run/netns/${POD_UUID}"
+nsenter --mount=/proc/1/ns/mnt -- mount --bind "/proc/$$/ns/net" "/run/netns/${POD_UUID}"
+export NSPAWN_NET_ARGS="--network-namespace-path=/run/netns/${POD_UUID}"
+
+ip link set dev lo up
+
+# Allow rootless Stage 2 apps in this network namespace to use ICMP echo sockets without CAP_NET_RAW
+sysctl -q -w net.ipv4.ping_group_range="0 2147483647" 2>/dev/null || true
+
+for cred in "${CRED_DIR}"/net.if.*; do
+    if [ ! -f "$cred" ]; then
+        continue
+    fi
+    spec="$(tr -d ' \t\r\n' < "$cred")"
+    ifname="$(read_kv ifname "$spec")"
+    master="$(read_kv master "$spec")"
+    kind="$(read_kv kind "$spec" || printf 'vlan')"
+    vlan_id="$(read_kv vlan_id "$spec" || printf '')"
+    addr="$(read_kv addr "$spec" || printf '')"
+    gw="$(read_kv gw "$spec" || printf '')"
+
+    if [ "$kind" = "vlan" ]; then
+        nsenter --net=/proc/1/ns/net \
+            ip link add link "$master" netns "$$" name "$ifname" type vlan id "$vlan_id"
+    else
+        nsenter --net=/proc/1/ns/net \
+            ip link add link "$master" netns "$$" name "$ifname" type "$kind"
+    fi
+    ip link set dev "$ifname" up
+    if [ -n "$addr" ]; then
+        ip addr add "$addr" dev "$ifname"
+    fi
+    if [ -n "$gw" ]; then
+        ip route add default via "$gw" dev "$ifname"
+    fi
+done
+
+exec /usr/lib/systemd/pod-container-start

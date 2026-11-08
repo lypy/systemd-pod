@@ -1,0 +1,33 @@
+#!/bin/sh
+set -eu
+
+RUN_DIR="${RUNTIME_DIRECTORY:-}"
+if [ -z "$RUN_DIR" ]; then
+    exit 0
+fi
+
+MACHINE_NAME=""
+if [ -f "${RUN_DIR}/machine-name" ]; then
+    MACHINE_NAME="$(tr -d ' \t\r\n' < "${RUN_DIR}/machine-name")"
+fi
+
+if [ -z "$MACHINE_NAME" ]; then
+    exit 0
+fi
+
+i=0
+while [ "$i" -lt 100 ]; do
+    leader="$(machinectl show "$MACHINE_NAME" -p Leader --value 2>/dev/null || true)"
+    if [ -n "$leader" ]; then
+        if [ "$leader" -gt 0 ] 2>/dev/null; then
+            if nsenter --mount="/proc/${leader}/ns/mnt" -- test -S /run/dbus/system_bus_socket 2>/dev/null; then
+                exit 0
+            fi
+        fi
+    fi
+    sleep 0.1
+    i=$((i + 1))
+done
+
+echo "Timed out waiting for D-Bus socket inside ${MACHINE_NAME}" > /dev/stderr
+exit 1

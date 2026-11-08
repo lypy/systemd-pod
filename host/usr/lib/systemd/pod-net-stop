@@ -1,0 +1,32 @@
+#!/bin/sh
+set -eu
+
+CRED_DIR="${CREDENTIALS_DIRECTORY:-/run/credentials}"
+POD_UUID=""
+
+if [ -f "${CRED_DIR}/pod.uuid" ]; then
+    POD_UUID="$(tr -d ' \t\r\n' < "${CRED_DIR}/pod.uuid")"
+    POD_UUID="${POD_UUID#pod-}"
+elif [ -n "${RUNTIME_DIRECTORY:-}" ]; then
+    if [ -f "${RUNTIME_DIRECTORY}/uuid" ]; then
+        POD_UUID="$(tr -d ' \t\r\n' < "${RUNTIME_DIRECTORY}/uuid")"
+    fi
+fi
+
+if [ -n "${POD_UUID}" ]; then
+    if nsenter --mount=/proc/1/ns/mnt -- test -e "/run/netns/${POD_UUID}"; then
+        nsenter --mount=/proc/1/ns/mnt -- umount -l "/run/netns/${POD_UUID}" 2>/dev/null || true
+        nsenter --mount=/proc/1/ns/mnt -- rm -f "/run/netns/${POD_UUID}" 2>/dev/null || true
+    fi
+fi
+
+if [ -n "${RUNTIME_DIRECTORY:-}" ]; then
+    for app_mnt in "${RUNTIME_DIRECTORY}"/app-rootfs/*; do
+        if [ -d "$app_mnt" ]; then
+            umount -l "$app_mnt" 2>/dev/null || true
+        fi
+    done
+    if [ -d "${RUNTIME_DIRECTORY}/stage1" ]; then
+        umount -l "${RUNTIME_DIRECTORY}/stage1" 2>/dev/null || true
+    fi
+fi
