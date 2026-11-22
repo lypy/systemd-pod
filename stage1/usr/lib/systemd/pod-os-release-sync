@@ -32,7 +32,7 @@ if [ -n "$cgroup_slice" ]; then
                     pid="$cand_pid"
                     break
                 fi
-            done < "${unit_dir}/cgroup.procs"
+            done < "${unit_dir}/cgroup.procs" 2>/dev/null || true
         fi
         if [ -z "$pid" ]; then
             continue
