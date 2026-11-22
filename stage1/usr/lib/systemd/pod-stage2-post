@@ -1,0 +1,20 @@
+#!/bin/sh
+set -eu
+
+app_id="${1:-}"
+if [ -n "$app_id" ]; then
+    unit_name="${app_id}.service"
+    main_pid="$(systemctl show -p MainPID --value "${unit_name}" 2>/dev/null || true)"
+    app_inv="$(systemctl show -p InvocationID --value "${unit_name}" 2>/dev/null || true)"
+    if [ -n "$main_pid" ] && [ "$main_pid" -gt 0 ] 2>/dev/null && [ -n "$app_inv" ]; then
+        if [ -e "/proc/${main_pid}/ns/uts" ] && [ ! "/proc/${main_pid}/ns/uts" -ef /proc/1/ns/uts ]; then
+            /usr/bin/nsenter --target="${main_pid}" --uts /bin/hostname "${app_inv}"
+            root_dir="/opt/stage2/${app_id}/rootfs"
+            if [ -d "${root_dir}/etc" ]; then
+                printf '%s\n' "${app_inv}" > "${root_dir}/etc/hostname"
+            fi
+        fi
+    fi
+fi
+
+exec /usr/lib/systemd/pod-os-release-sync

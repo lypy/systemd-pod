@@ -1,10 +1,12 @@
 #!/bin/sh
 set -eu
 
+exec 9>/run/pod-os-release-sync.lock
+flock 9
+
 apps=""
 seen_imgs=","
 version_id=""
-stage1_hostname="$(uname -n)"
 
 cgroup_slice=""
 if [ -d /sys/fs/cgroup/system.slice ]; then
@@ -20,14 +22,19 @@ if [ -n "$cgroup_slice" ]; then
         fi
         unit_name="${unit_dir##*/}"
         case "$unit_name" in
-            dbus.service|systemd-*|container-*|pod-os-release-*|run-*.service) continue ;;
+            dbus.service|systemd-*|container-*|pod-os-release-*|pod-stage2-post@*|run-*.service) continue ;;
         esac
 
         pid=""
         if [ -r "${unit_dir}/cgroup.procs" ]; then
-            IFS= read -r pid < "${unit_dir}/cgroup.procs" || true
+            while IFS= read -r cand_pid; do
+                if [ -n "$cand_pid" ] && [ -e "/proc/${cand_pid}/root" ] && [ ! "/proc/${cand_pid}/root" -ef / ]; then
+                    pid="$cand_pid"
+                    break
+                fi
+            done < "${unit_dir}/cgroup.procs"
         fi
-        if [ -z "$pid" ] || [ ! -e "/proc/${pid}/root" ] || [ "/proc/${pid}/root" -ef / ]; then
+        if [ -z "$pid" ]; then
             continue
         fi
 
@@ -52,17 +59,6 @@ if [ -n "$cgroup_slice" ]; then
         fi
 
         root_dir="/opt/stage2/${app_id}/rootfs"
-        if [ -e "/proc/${pid}/ns/uts" ] && [ ! "/proc/${pid}/ns/uts" -ef /proc/1/ns/uts ]; then
-            cur_host="$(/usr/bin/nsenter --target="${pid}" --uts uname -n 2>/dev/null || true)"
-            if [ -z "$cur_host" ] || [ "$cur_host" = "$stage1_hostname" ]; then
-                app_inv="$(systemctl show -p InvocationID --value "${unit_name}" 2>/dev/null || true)"
-                if [ -n "$app_inv" ]; then
-                    /usr/bin/nsenter --target="${pid}" --uts /bin/hostname "${app_inv}" 2>/dev/null || true
-                    printf '%s\n' "${app_inv}" > "${root_dir}/etc/hostname"
-                fi
-            fi
-        fi
-
         if [ -f "/opt/stage2/${app_id}/image" ]; then
             img_name="$(tr -d ' \t\r\n' < "/opt/stage2/${app_id}/image")"
         else
@@ -100,21 +96,22 @@ if [ -f /usr/lib/os-release ]; then
     fi
 fi
 
+tmp_file="/etc/os-release.tmp.$$"
 if [ -n "$apps" ]; then
-    cat > /etc/os-release.tmp << EOR
+    cat > "${tmp_file}" << EOR
 PRETTY_NAME="${pretty_name}"
 NAME="${os_name}"
 ID="${apps}"
 VERSION_ID="${version_id}"
 EOR
-    mv -f /etc/os-release.tmp /etc/os-release
+    mv -f "${tmp_file}" /etc/os-release
 elif [ -f /usr/lib/os-release ]; then
-    cp /usr/lib/os-release /etc/os-release.tmp
-    mv -f /etc/os-release.tmp /etc/os-release
+    cp /usr/lib/os-release "${tmp_file}"
+    mv -f "${tmp_file}" /etc/os-release
 else
-    cat > /etc/os-release.tmp << EOR
+    cat > "${tmp_file}" << EOR
 PRETTY_NAME="${pretty_name}"
 NAME="${os_name}"
 EOR
-    mv -f /etc/os-release.tmp /etc/os-release
+    mv -f "${tmp_file}" /etc/os-release
 fi

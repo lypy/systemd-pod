@@ -1,0 +1,10 @@
+[Unit]
+Description=Post-start UTS hostname and os-release sync for Stage 2 %i
+DefaultDependencies=no
+After=%i.service
+Before=pod-idle.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/systemd/pod-stage2-post %i

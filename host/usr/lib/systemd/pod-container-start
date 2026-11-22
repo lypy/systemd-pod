@@ -50,17 +50,20 @@ read_kv() {
     target_key="$1"
     kv_string="$2"
     old_ifs="$IFS"
+    set -f
     IFS=','
     for pair in $kv_string; do
         k="${pair%%=*}"
         v="${pair#*=}"
         if [ "$k" = "$target_key" ]; then
             IFS="$old_ifs"
+            set +f
             printf '%s' "$v"
             return 0
         fi
     done
     IFS="$old_ifs"
+    set +f
     return 1
 }
 
@@ -78,11 +81,13 @@ if [ -f "${CRED_DIR}/net.dns" ]; then
     dns_raw="$(tr -d ' \t\r\n' < "${CRED_DIR}/net.dns")"
     : > "${STAGE1_ROOT}/etc/resolv.conf"
     old_ifs="$IFS"
+    set -f
     IFS=','
     for srv in $dns_raw; do
         printf 'nameserver %s\n' "$srv" >> "${STAGE1_ROOT}/etc/resolv.conf"
     done
     IFS="$old_ifs"
+    set +f
 else
     cp /etc/resolv.conf "${STAGE1_ROOT}/etc/resolv.conf"
 fi
@@ -105,8 +110,8 @@ for cred in "${CRED_DIR}"/vol.*; do
 done
 
 # 4. Process declarative host bind mounts (host.bind.<name>:src=/path,dst=/path,ro=true)
-#     before Stage 2 app overlays so Stage 2 bind/bind_ro can inspect whether a
-#     /vol/* source path is a file or a directory.
+#    before Stage 2 app overlays so Stage 2 BindPaths / BindReadOnlyPaths can inspect
+#    whether a /vol/* source path is a file or a directory.
 NSPAWN_HOST_BINDS=""
 for cred in "${CRED_DIR}"/host.bind.*; do
     if [ ! -f "$cred" ]; then
@@ -154,12 +159,48 @@ is_file_bind_src() {
     return 1
 }
 
-# 5. Mount each Stage 2 application instance overlay outside STAGE1_ROOT at
-#    ${RUN_DIR}/app-rootfs/<app_id> and pass --bind to systemd-nspawn so
-#    setup_root() does not strip the mount and multiple instances of the same
-#    image each receive an isolated ephemeral OverlayFS.
+prepare_bind_mountpoints() {
+    bind_list="$1"
+    bp_old_ifs="$IFS"
+    case "$-" in
+        *f*) bp_had_noglob=1 ;;
+        *)   bp_had_noglob=0; set -f ;;
+    esac
+    IFS=' '
+    for bind_entry in $bind_list; do
+        raw="${bind_entry#-}"
+        src="${raw%%:*}"
+        case "$raw" in
+            *:*)
+                rest="${raw#*:}"
+                dst="${rest%%:*}"
+                ;;
+            *)
+                dst="$src"
+                ;;
+        esac
+        if [ -n "$dst" ]; then
+            if [ -f "${app_merged}${dst}" ] || is_file_bind_src "$src"; then
+                mkdir -p "${app_merged}${dst%/*}"
+                touch "${app_merged}${dst}"
+            else
+                mkdir -p "${app_merged}${dst}"
+            fi
+        fi
+    done
+    IFS="$bp_old_ifs"
+    if [ "$bp_had_noglob" -eq 0 ]; then
+        set +f
+    fi
+}
+
+# 5. Mount each Stage 2 application overlay and emit its native Stage 1 systemd unit
+#    under ${STAGE1_ROOT}/etc/systemd/system/ so Stage 1 boots all Stage 2 units in
+#    one transaction before signalling READY=1 via --notify-ready=yes.
 NSPAWN_APP_BINDS=""
-mkdir -p "${STAGE1_ROOT}/opt/stage2" "${RUN_DIR}/app-rootfs" "${RUN_DIR}/app-upper" "${RUN_DIR}/app-work"
+UNIT_DIR="${STAGE1_ROOT}/etc/systemd/system"
+mkdir -p "${STAGE1_ROOT}/opt/stage2" "${RUN_DIR}/app-rootfs" "${RUN_DIR}/app-upper" "${RUN_DIR}/app-work" \
+         "${UNIT_DIR}/pod-idle.target.wants"
 
 for cred in "${CRED_DIR}"/pod.app.*; do
     if [ ! -f "$cred" ]; then
@@ -204,32 +245,113 @@ for cred in "${CRED_DIR}"/pod.app.*; do
     cp "${STAGE1_ROOT}/etc/resolv.conf" "${app_merged}/etc/resolv.conf"
     cp "${STAGE1_ROOT}/etc/hostname" "${app_merged}/etc/hostname"
 
+    unit_lines=""
+    svc_lines=""
+    has_exec_override=0
+    nl='
+'
+
     case "$spec" in
         *=*)
             old_ifs="$IFS"
+            set -f
             IFS=','
             for pair in $spec; do
                 k="${pair%%=*}"
                 v="${pair#*=}"
                 case "$k" in
-                    bind|bind_ro)
-                        src="${v%%:*}"
-                        dst="${v#*:}"
-                        dst="${dst%%:*}"
-                        if [ -n "$dst" ]; then
-                            if [ -f "${app_merged}${dst}" ] || is_file_bind_src "$src"; then
-                                mkdir -p "${app_merged}${dst%/*}"
-                                touch "${app_merged}${dst}"
-                            else
-                                mkdir -p "${app_merged}${dst}"
-                            fi
+                    image)
+                        ;;
+                    Description|Documentation|After|Before|Wants|Requires|Requisite|BindsTo|PartOf|Upholds|Conflicts|OnFailure|OnSuccess|PropagatesReloadTo|ReloadPropagatedFrom|PropagatesStopTo|StopPropagatedFrom|JoinsNamespaceOf|StartLimitIntervalSec|StartLimitBurst|StartLimitAction|Condition*|Assert*)
+                        unit_lines="${unit_lines}${k}=${v}${nl}"
+                        ;;
+                    ExecStart)
+                        if [ "$has_exec_override" -eq 0 ]; then
+                            svc_lines="${svc_lines}ExecStart=${nl}"
+                            has_exec_override=1
                         fi
+                        svc_lines="${svc_lines}ExecStart=${v}${nl}"
+                        ;;
+                    BindPaths|BindReadOnlyPaths)
+                        prepare_bind_mountpoints "$v"
+                        svc_lines="${svc_lines}${k}=${v}${nl}"
+                        ;;
+                    *)
+                        svc_lines="${svc_lines}${k}=${v}${nl}"
                         ;;
                 esac
             done
             IFS="$old_ifs"
+            set +f
             ;;
     esac
+
+    # Ensure mountpoints for any BindPaths/BindReadOnlyPaths declared in /etc/pod.service
+    if [ -f "${img_dir}/etc/pod.service" ]; then
+        while IFS= read -r line || [ -n "$line" ]; do
+            case "$line" in
+                BindPaths=*|BindReadOnlyPaths=*)
+                    prepare_bind_mountpoints "${line#*=}"
+                    ;;
+            esac
+        done < "${img_dir}/etc/pod.service"
+    fi
+
+    has_image_exec=0
+    if [ -f "${img_dir}/etc/pod.service" ] && grep -q '^[[:space:]]*ExecStart=' "${img_dir}/etc/pod.service"; then
+        has_image_exec=1
+    fi
+    if [ "$has_exec_override" -eq 0 ] && [ "$has_image_exec" -eq 0 ]; then
+        echo "No ExecStart= in ${cred} and no /etc/pod.service with ExecStart= in ${img_dir}" >&2
+        exit 1
+    fi
+
+    dropin_dir="${UNIT_DIR}/${app_id}.service.d"
+    mkdir -p "${dropin_dir}"
+
+    # Base unit: runtime defaults (overridable by 10-image.conf and 20-credential.conf)
+    {
+        printf '[Unit]\n'
+        printf 'Description=Pod Stage 2 Application %s (%s)\n' "${app_id}" "${img_name}"
+        printf 'Wants=pod-stage2-post@%s.service\n' "${app_id}"
+        cat <<'EOF'
+DefaultDependencies=no
+After=systemd-journald.socket systemd-journald-dev-log.socket dbus.socket
+Before=pod-idle.target shutdown.target
+Conflicts=shutdown.target
+
+[Service]
+Type=exec
+NotifyAccess=all
+Restart=always
+RestartSec=2s
+TimeoutStartSec=30s
+MountAPIVFS=yes
+ProtectHostname=yes
+EOF
+        printf 'LogExtraFields=POD_UNIT=%s\n' "${MACHINE_NAME}"
+        printf 'RootDirectory=%s\n' "${app_target}"
+        printf 'EnvironmentFile=-%s/etc/pod-environment\n' "${app_target}"
+    } > "${UNIT_DIR}/${app_id}.service"
+
+    # Layer 10: Stage 2 image defaults from /etc/pod.service
+    if [ -f "${img_dir}/etc/pod.service" ]; then
+        cp "${img_dir}/etc/pod.service" "${dropin_dir}/10-image.conf"
+    fi
+
+    # Layer 20: Per-pod credential overrides from SetCredential=pod.app.<app_id>
+    if [ -n "$unit_lines" ] || [ -n "$svc_lines" ]; then
+        {
+            if [ -n "$unit_lines" ]; then
+                printf '[Unit]\n%s' "${unit_lines}"
+            fi
+            if [ -n "$svc_lines" ]; then
+                printf '[Service]\n%s' "${svc_lines}"
+            fi
+        } > "${dropin_dir}/20-credential.conf"
+    fi
+
+    ln -sf "../${app_id}.service" "${UNIT_DIR}/pod-idle.target.wants/${app_id}.service"
 
     NSPAWN_APP_BINDS="${NSPAWN_APP_BINDS} --bind=${app_merged}:${app_target}"
 done

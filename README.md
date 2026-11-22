@@ -1,16 +1,15 @@
 # Example pod runtime with systemd-nspawn and machinectl
 
-This project mirrors the [rkt](https://github.com/rkt) style two-stage pod container architecture using `systemd-nspawn`, `systemd-run`, and `machinectl`. `rkt` is end-of-life, while `systemd-nspawn` and `systemd-networkd` operate a layer below the pod abstraction.
+This project mirrors the [rkt](https://github.com/rkt) style two-stage pod container architecture using `systemd-nspawn` and `machinectl`. `rkt` is end-of-life, while `systemd-nspawn` and `systemd-networkd` operate a layer below the pod abstraction.
 
-A shared read-only stage 1 image (`/var/lib/machines/stage1-debian`) provides the inner `systemd` PID 1 supervisor for each pod, while stage 2 application images in `/var/lib/machines/<image>` run inside the pod with isolated per-instance ephemeral OverlayFS root filesystems (`RootDirectory=/opt/stage2/<app>/rootfs`) and shared pod namespaces (`net`, `ipc`, `uts`, `pid`, and `cgroup`).
+A shared read-only stage 1 image (`/var/lib/machines/stage1-debian`) provides the inner `systemd` PID 1 supervisor for each pod, while stage 2 application images in `/var/lib/machines/<image>` run inside the pod with isolated per-instance ephemeral OverlayFS root filesystems (`RootDirectory=/opt/stage2/<app>/rootfs`) and shared pod namespaces (`net`, `ipc`, `pid`, and `cgroup`) with private per-application UTS namespaces (`ProtectHostname=yes`).
 
-Networking setup, container construction, and application dispatch are split into modular host scripts while leaving process supervision and namespace management to systemd. `SetCredential=` (introduced in systemd 247) passes declarative parameters from the unit file to the host scripts:
+Networking setup and container construction are split into modular host scripts while leaving process supervision, dependency ordering, and namespace management to systemd. `SetCredential=` (introduced in systemd 247) passes declarative parameters from the unit file to the host scripts:
 
 1. `host/usr/lib/systemd/pod-net-host-start` configures a pod to share the host network namespace and delegates container setup to `pod-container-start`.
 2. `host/usr/lib/systemd/pod-net-vlan-start` configures an isolated network namespace (`PrivateNetwork=yes`), attaches VLAN or virtual interfaces from `SetCredential=net.if.*`, and delegates container setup to `pod-container-start`.
-3. `host/usr/lib/systemd/pod-container-start` derives the machine name from the systemd unit name, sets the container hostname to `INVOCATION_ID` (unless `SetCredential=pod.hostname:` is specified), derives a deterministic `/etc/machine-id` per host and unit for persistent journaling across restarts, mounts the per-pod stage 1 overlay, shared `/vol/*` directories, stage 2 application overlays, declarative host bind mounts, and container journal directories before executing `systemd-nspawn --notify-ready=yes`.
-4. `host/usr/lib/systemd/pod-wait-ready` verifies the inner stage 1 D-Bus socket is ready to accept connections (returning immediately when `systemd-nspawn --notify-ready=yes` is used, and also ensuring `pod-apps-start` runs as the second `ExecStartPost=` to avoid a systemd 252 bug where the first `ExecStartPost=` masks `/run/credentials` when `PrivateIPC=yes` and `SetCredential=` are combined).
-5. `host/usr/lib/systemd/pod-apps-start` reads `SetCredential=pod.app.*` definitions and launches each stage 2 application inside the pod via `systemd-run --machine` with `ProtectHostname=yes` (so each stage 2 overlay receives its own UTS namespace and distinct stage 2 `InvocationID` hostname) and `LogExtraFields=POD_UNIT=<machine>`.
+3. `host/usr/lib/systemd/pod-container-start` derives the machine name from the systemd unit name, sets the stage 1 hostname to `INVOCATION_ID` (unless `SetCredential=pod.hostname:` is specified), derives a deterministic `/etc/machine-id` per host and unit for persistent journaling across restarts, mounts the per-pod stage 1 overlay, shared `/vol/*` directories, stage 2 application overlays, declarative host bind mounts, and container journal directories, emits native stage 2 `.service` units and drop-ins under `${STAGE1_ROOT}/etc/systemd/system/`, and executes `systemd-nspawn --notify-ready=yes`.
+4. `stage1/etc/systemd/system/pod-stage2-post@.service` and `stage1/usr/lib/systemd/pod-stage2-post` run inside stage 1 after each stage 2 service starts or restarts, stamping each stage 2 private UTS namespace and `/etc/hostname` with its own `InvocationID` and synchronising `/etc/os-release` under `flock` before `pod-idle.target` signals readiness to the host.
 
 ---
 
@@ -23,13 +22,11 @@ Networking setup, container construction, and application dispatch are split int
 │   └── usr
 │       └── lib
 │           └── systemd
-│               ├── pod-apps-start
 │               ├── pod-container-start
 │               ├── pod-net-host-start
 │               ├── pod-net-start
 │               ├── pod-net-stop
-│               ├── pod-net-vlan-start
-│               └── pod-wait-ready
+│               └── pod-net-vlan-start
 └── stage1
     ├── etc
     │   ├── profile.d
@@ -45,6 +42,7 @@ Networking setup, container construction, and application dispatch are split int
     │           ├── pod-idle.target
     │           ├── pod-os-release-sync.path
     │           ├── pod-os-release-sync.service
+    │           ├── pod-stage2-post@.service
     │           ├── systemd-journald-dev-log.socket.d
     │           │   └── 10-no-deps.conf
     │           ├── systemd-journald.service.d
@@ -54,18 +52,19 @@ Networking setup, container construction, and application dispatch are split int
     └── usr
         └── lib
             └── systemd
-                └── pod-os-release-sync
+                ├── pod-os-release-sync
+                └── pod-stage2-post
 ```
 
 ---
 
 ## Building the stage 1 image with debootstrap
 
-The stage 1 supervisor image resides at `/var/lib/machines/stage1-debian`. It requires `systemd`, `systemd-sysv`, and `dbus` so that `systemd-run --machine` and `machinectl shell` can communicate with the inner PID 1 over D-Bus, along with `DefaultDependencies=no` drop-ins so that `pod-idle.target` starts only the supervisor sockets, journal, and D-Bus daemon.
+The stage 1 supervisor image resides at `/var/lib/machines/stage1-debian`. It requires `systemd`, `systemd-sysv`, and `dbus` so that `systemctl --machine`, `systemd-run --machine`, and `machinectl shell` can communicate with the inner PID 1 over D-Bus, along with `DefaultDependencies=no` drop-ins so that `pod-idle.target` starts only the supervisor sockets, journal, D-Bus daemon, and pre-generated stage 2 units.
 
 ### 1. Bootstrap a minimal Debian Bookworm root filesystem
 
-Include `dbus`, `systemd`, `systemd-sysv`, `util-linux` (for `/usr/bin/nsenter` in `pod-enter.sh`), and `bash` in the `debootstrap` invocation:
+Include `dbus`, `systemd`, `systemd-sysv`, `util-linux` (for `/usr/bin/nsenter` and `flock`), and `bash` in the `debootstrap` invocation:
 
 ```sh
 sudo debootstrap \
@@ -83,6 +82,7 @@ Copy the files from [`stage1/`](stage1/) into `/var/lib/machines/stage1-debian`:
 * [`stage1/etc/systemd/system/pod-idle.target`](stage1/etc/systemd/system/pod-idle.target)
 * [`stage1/etc/systemd/system/pod-os-release-sync.path`](stage1/etc/systemd/system/pod-os-release-sync.path)
 * [`stage1/etc/systemd/system/pod-os-release-sync.service`](stage1/etc/systemd/system/pod-os-release-sync.service)
+* [`stage1/etc/systemd/system/pod-stage2-post@.service`](stage1/etc/systemd/system/pod-stage2-post@.service)
 * [`stage1/etc/systemd/system/container-shell@.service.d/10-no-deps.conf`](stage1/etc/systemd/system/container-shell@.service.d/10-no-deps.conf)
 * [`stage1/etc/systemd/system/dbus.socket.d/10-no-deps.conf`](stage1/etc/systemd/system/dbus.socket.d/10-no-deps.conf)
 * [`stage1/etc/systemd/system/dbus.service.d/10-no-deps.conf`](stage1/etc/systemd/system/dbus.service.d/10-no-deps.conf)
@@ -90,12 +90,15 @@ Copy the files from [`stage1/`](stage1/) into `/var/lib/machines/stage1-debian`:
 * [`stage1/etc/systemd/system/systemd-journald-dev-log.socket.d/10-no-deps.conf`](stage1/etc/systemd/system/systemd-journald-dev-log.socket.d/10-no-deps.conf)
 * [`stage1/etc/systemd/system/systemd-journald.service.d/10-no-deps.conf`](stage1/etc/systemd/system/systemd-journald.service.d/10-no-deps.conf)
 * [`stage1/usr/lib/systemd/pod-os-release-sync`](stage1/usr/lib/systemd/pod-os-release-sync)
+* [`stage1/usr/lib/systemd/pod-stage2-post`](stage1/usr/lib/systemd/pod-stage2-post)
 * [`stage1/etc/profile.d/pod-enter.sh`](stage1/etc/profile.d/pod-enter.sh)
 
 ```sh
 sudo cp -r stage1/etc/* /var/lib/machines/stage1-debian/etc/
 sudo cp -r stage1/usr/* /var/lib/machines/stage1-debian/usr/
-sudo chmod 0755 /var/lib/machines/stage1-debian/usr/lib/systemd/pod-os-release-sync
+sudo chmod 0755 \
+  /var/lib/machines/stage1-debian/usr/lib/systemd/pod-os-release-sync \
+  /var/lib/machines/stage1-debian/usr/lib/systemd/pod-stage2-post
 sudo chmod 0644 /var/lib/machines/stage1-debian/etc/profile.d/pod-enter.sh
 ```
 
@@ -132,24 +135,20 @@ sudo machinectl read-only stage1-debian yes
 
 ## Installing the host scripts
 
-Install the seven lifecycle scripts from [`host/usr/lib/systemd/`](host/usr/lib/systemd/) into `/usr/lib/systemd/`:
+Install the five lifecycle scripts from [`host/usr/lib/systemd/`](host/usr/lib/systemd/) into `/usr/lib/systemd/`:
 
-* [`host/usr/lib/systemd/pod-apps-start`](host/usr/lib/systemd/pod-apps-start)
 * [`host/usr/lib/systemd/pod-container-start`](host/usr/lib/systemd/pod-container-start)
 * [`host/usr/lib/systemd/pod-net-host-start`](host/usr/lib/systemd/pod-net-host-start)
 * [`host/usr/lib/systemd/pod-net-vlan-start`](host/usr/lib/systemd/pod-net-vlan-start)
 * [`host/usr/lib/systemd/pod-net-start`](host/usr/lib/systemd/pod-net-start)
-* [`host/usr/lib/systemd/pod-wait-ready`](host/usr/lib/systemd/pod-wait-ready)
 * [`host/usr/lib/systemd/pod-net-stop`](host/usr/lib/systemd/pod-net-stop)
 
 ```sh
 sudo install -m 0755 \
-  host/usr/lib/systemd/pod-apps-start \
   host/usr/lib/systemd/pod-container-start \
   host/usr/lib/systemd/pod-net-host-start \
   host/usr/lib/systemd/pod-net-vlan-start \
   host/usr/lib/systemd/pod-net-start \
-  host/usr/lib/systemd/pod-wait-ready \
   host/usr/lib/systemd/pod-net-stop \
   /usr/lib/systemd/
 ```
@@ -164,36 +163,34 @@ Stage 2 images are root filesystem directories stored in `/var/lib/machines/<app
 sudo machinectl import-tar alpine-minirootfs-3.18.4-riscv64.tar.gz test-ping
 ```
 
-`pod-apps-start` supports two ways of defining the command executed for each stage 2 application:
+Each stage 2 application unit is assembled inside stage 1 from three standard `systemd` layers:
 
-1. Passing `exec=` directly in the `SetCredential=pod.app.<name>:image=<image>,exec=<command>` credential on the pod unit.
-2. Embedding a default command in `/var/lib/machines/<image>/etc/pod-entrypoint` before marking the image read-only:
+1. Base unit (`/etc/systemd/system/<app>.service`): runtime defaults (`Type=exec`, `NotifyAccess=all`, `Restart=always`, `RestartSec=2s`, `TimeoutStartSec=30s`, `MountAPIVFS=yes`, `ProtectHostname=yes`, `RootDirectory=/opt/stage2/<app>/rootfs`, `LogExtraFields=POD_UNIT=<machine>`, `Wants=pod-stage2-post@<app>.service`, `Before=pod-idle.target shutdown.target`, `Conflicts=shutdown.target`).
+2. Image drop-in (`10-image.conf`): copied directly from `/var/lib/machines/<image>/etc/pod.service` when present.
+3. Credential drop-in (`20-credential.conf`): generated directly from native `systemd.unit(5)` and `systemd.service(5)` directives in `SetCredential=pod.app.<app>:image=<image>,<Key>=<Value>,...`.
+
+To embed default service settings in `/var/lib/machines/<image>/etc/pod.service` before marking the image read-only:
 
 ```sh
-echo "/bin/ping 127.0.0.1" | sudo tee /var/lib/machines/test-ping/etc/pod-entrypoint
+sudo tee /var/lib/machines/test-ping/etc/pod.service >/dev/null <<'EOF'
+[Service]
+ExecStart=/bin/ping 127.0.0.1
+EOF
 sudo machinectl read-only test-ping yes
 ```
 
-When `/etc/pod-entrypoint` is present inside the image, `SetCredential=pod.app.ping:test-ping` (or `SetCredential=pod.app.ping:image=test-ping`) launches the default command without needing `exec=` in the unit file.
-
-Stage 2 images can also embed optional default files in `/etc/` (`pod-type`, `pod-user`, `pod-group`, `pod-wd`, `pod-caps`, and `pod-environment`), and any of these settings can be configured or overridden per application instance via comma-separated keys in `SetCredential=pod.app.<name>:...`:
+When `/etc/pod.service` declares `ExecStart=`, `SetCredential=pod.app.ping:test-ping` (or `SetCredential=pod.app.ping:image=test-ping,MemoryMax=64M,TasksMax=16`) launches the image default with any native `systemd` overrides applied in `20-credential.conf`.
 
 * `image=<image>` selects the stage 2 image in `/var/lib/machines/<image>`.
-* `exec=<cmd>` sets the application command line (falling back to `/etc/pod-entrypoint`).
-* `type=<type>` sets the systemd service `Type=` (falling back to `/etc/pod-type`, and enabling `NotifyAccess=all` automatically when set to `notify` or `notify-reload`).
-* `bind=<src>:<dst>` and `bind_ro=<src>:<dst>` mount pod `/vol/*` or stage 1 paths into the stage 2 root filesystem.
-* `after=<unit>` orders startup after one or more sibling stage 2 units (across multi-tier dependency chains) or stage 1 units inside the pod.
-* `user=<user>` and `group=<group>` set `User=` and `Group=` (falling back to `/etc/pod-user` and `/etc/pod-group`), while `sup_groups=<g1> <g2>` sets `SupplementaryGroups=`.
-* `caps=<cap1> <cap2>` and `ambient_caps=<cap1> <cap2>` set `CapabilityBoundingSet=` (falling back to `/etc/pod-caps`) and `AmbientCapabilities=`. Pod-wide capabilities passed to `systemd-nspawn` can also be configured via `SetCredential=pod.caps:CAP_NET_ADMIN,CAP_NET_RAW,...`.
-* `exec_pre=<cmd>`, `exec_post=<cmd>`, and `exec_stop=<cmd>` configure `ExecStartPre=`, `ExecStartPost=`, and `ExecStopPost=` hooks inside the stage 2 root filesystem.
-* `memory_max=<bytes>`, `memory_high=<bytes>`, `cpu_quota=<pct>`, `cpu_weight=<weight>`, and `tasks_max=<n>` configure per-application cgroup resource limits.
-* `syscall_filter=<set>` sets `SystemCallFilter=`, `env=<KEY=VAL>` sets `Environment=` (supplementing `/etc/pod-environment`), and `wd=<path>` sets `WorkingDirectory=` (falling back to `/etc/pod-wd`).
+* `[Unit]` directives (`After=`, `Before=`, `Wants=`, `Requires=`, `BindsTo=`, `PartOf=`, `Conflicts=`, `Condition*=`, `Assert*=`, etc.) are written under `[Unit]` in `20-credential.conf`.
+* `[Service]` directives (`ExecStart=`, `Type=`, `User=`, `Group=`, `BindPaths=`, `BindReadOnlyPaths=`, `CapabilityBoundingSet=`, `AmbientCapabilities=`, `ExecStartPre=`, `ExecStartPost=`, `ExecStopPost=`, `MemoryMax=`, `CPUQuota=`, `TasksMax=`, `SystemCallFilter=`, `Environment=`, `WorkingDirectory=`, etc.) are written under `[Service]` in `20-credential.conf`. `ExecStart=` automatically emits a reset line before the first credential override, and `BindPaths=` and `BindReadOnlyPaths=` pre-create destination mountpoints inside the stage 2 overlay.
+* Pod-wide capabilities passed to `systemd-nspawn` are configured via `SetCredential=pod.caps:CAP_NET_ADMIN,CAP_NET_RAW,...`.
 
 ---
 
 ## Running a pod with host networking
 
-When a pod runs with `PrivateNetwork=no`, `pod-net-host-start` (or `pod-net-start`) invokes `pod-container-start`. `systemd-run` generates a unique `run-r<32hex>.service` unit name automatically when `--unit=` is omitted; `RuntimeDirectory=pods/%N` allocates `/run/pods/<unit-name>`, `systemd-nspawn --notify-ready=yes` signals readiness once stage 1 finishes booting `pod-idle.target`, and `pod-apps-start` launches each `pod.app.*` credential inside the pod.
+When a pod runs with `PrivateNetwork=no`, `pod-net-host-start` (or `pod-net-start`) invokes `pod-container-start`. `systemd-run` generates a unique `run-r<32hex>.service` unit name automatically when `--unit=` is omitted; `RuntimeDirectory=pods/%N` allocates `/run/pods/<unit-name>`, `pod-container-start` writes the stage 2 units into the ephemeral stage 1 overlay, and `systemd-nspawn --notify-ready=yes` signals readiness once stage 1 finishes starting all stage 2 units and reaching `pod-idle.target`.
 
 ```sh
 sudo systemd-run --collect \
@@ -204,9 +201,8 @@ sudo systemd-run --collect \
   --property=PrivateIPC=yes \
   --property="RuntimeDirectory=pods/%N" \
   --property="SetCredential=pod.stage1:stage1-debian" \
-  --property="SetCredential=pod.app.ping:image=test-ping,exec=/bin/ping 127.0.0.1" \
-  --property="ExecStartPost=/usr/lib/systemd/pod-wait-ready" \
-  --property="ExecStartPost=/usr/lib/systemd/pod-apps-start" \
+  --property="SetCredential=pod.app.ping:image=test-ping,ExecStart=/bin/ping 127.0.0.1" \
+  --property="ExecStopPost=-/usr/lib/systemd/pod-net-stop" \
   /usr/lib/systemd/pod-net-host-start
 ```
 
@@ -227,9 +223,8 @@ sudo systemd-run --collect \
   --property="SetCredential=pod.stage1:stage1-debian" \
   --property="SetCredential=net.dns:1.1.1.1,8.8.8.8" \
   --property="SetCredential=net.if.vlan100:ifname=eth0,master=enp1s0,kind=vlan,vlan_id=100,addr=192.0.2.10/24,gw=192.0.2.1" \
-  --property="SetCredential=pod.app.ping:image=test-ping,exec=/bin/ping 192.0.2.1" \
-  --property="ExecStartPost=/usr/lib/systemd/pod-wait-ready" \
-  --property="ExecStartPost=/usr/lib/systemd/pod-apps-start" \
+  --property="SetCredential=pod.app.ping:image=test-ping,ExecStart=/bin/ping 192.0.2.1" \
+  --property="ExecStopPost=-/usr/lib/systemd/pod-net-stop" \
   /usr/lib/systemd/pod-net-vlan-start
 ```
 
@@ -237,7 +232,7 @@ sudo systemd-run --collect \
 
 ## Declarative systemd unit example
 
-Persistent pods can be managed as standard systemd units without hardcoded UUIDs. The unit name (`pod-bgp.service`) becomes the `machinectl` machine name (`pod-bgp`), `INVOCATION_ID` becomes the container hostname on each activation (overridable via `SetCredential=pod.hostname:<name>`), and `/etc/machine-id` is derived deterministically from the host `/etc/machine-id` and machine name so `journalctl -M pod-bgp` spans restarts:
+Persistent pods are managed as standard systemd units without hardcoded UUIDs or `ExecStartPost=` orchestration hooks. The unit name (`pod-bgp.service`) becomes the `machinectl` machine name (`pod-bgp`), `INVOCATION_ID` becomes the stage 1 hostname on each activation (overridable via `SetCredential=pod.hostname:<name>`), each stage 2 service receives its own `InvocationID` UTS hostname, and `/etc/machine-id` is derived deterministically from the host `/etc/machine-id` and machine name so `journalctl -M pod-bgp` spans restarts:
 
 ```ini
 [Unit]
@@ -261,12 +256,11 @@ SetCredential=pod.stage1:stage1-debian
 SetCredential=pod.caps:CAP_NET_ADMIN,CAP_NET_RAW,CAP_NET_BIND_SERVICE,CAP_SYS_ADMIN
 SetCredential=vol.run:mode=0775,uid=104,gid=107
 SetCredential=host.bind.conf:src=/etc/quagga,dst=/vol/conf,ro=true
-SetCredential=pod.app.zebra:image=zebra-riscv64,exec=/usr/lib/quagga/zebra -A 127.0.0.1,bind=/vol/run:/run/quagga,bind_ro=/vol/conf:/etc/quagga,caps=CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_ADMIN CAP_SETUID CAP_SETGID CAP_CHOWN CAP_DAC_OVERRIDE,memory_max=256M,tasks_max=64
-SetCredential=pod.app.bgpd:image=bgpd-riscv64,exec=/usr/lib/quagga/bgpd -A 127.0.0.1,bind=/vol/run:/run/quagga,bind_ro=/vol/conf:/etc/quagga,after=zebra.service,caps=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE CAP_NET_BROADCAST CAP_SYS_ADMIN CAP_SETUID CAP_SETGID CAP_CHOWN CAP_DAC_OVERRIDE,memory_max=256M,tasks_max=64
+SetCredential=pod.app.zebra:image=zebra-riscv64,ExecStart=/usr/lib/quagga/zebra -A 127.0.0.1,BindPaths=/vol/run:/run/quagga,BindReadOnlyPaths=/vol/conf:/etc/quagga,CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_ADMIN CAP_SETUID CAP_SETGID CAP_CHOWN CAP_DAC_OVERRIDE,MemoryMax=256M,TasksMax=64
+SetCredential=pod.app.bgpd:image=bgpd-riscv64,After=zebra.service,ExecStart=/usr/lib/quagga/bgpd -A 127.0.0.1,BindPaths=/vol/run:/run/quagga,BindReadOnlyPaths=/vol/conf:/etc/quagga,CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE CAP_NET_BROADCAST CAP_SYS_ADMIN CAP_SETUID CAP_SETGID CAP_CHOWN CAP_DAC_OVERRIDE,MemoryMax=256M,TasksMax=64
 
 ExecStart=/usr/lib/systemd/pod-net-start
-ExecStartPost=/usr/lib/systemd/pod-wait-ready
-ExecStartPost=/usr/lib/systemd/pod-apps-start
+ExecStopPost=-/usr/lib/systemd/pod-net-stop
 
 [Install]
 WantedBy=multi-user.target
