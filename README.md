@@ -4,12 +4,14 @@ This project mirrors the [rkt](https://github.com/rkt) style two-stage pod conta
 
 A shared read-only stage 1 image (`/var/lib/machines/stage1-debian`) provides the inner `systemd` PID 1 supervisor for each pod, while stage 2 application images in `/var/lib/machines/<image>` run inside the pod with isolated per-instance ephemeral OverlayFS root filesystems (`RootDirectory=/opt/stage2/<app>/rootfs`) and shared pod namespaces (`net`, `ipc`, `pid`, and `cgroup`) with private per-application UTS namespaces (`ProtectHostname=yes`).
 
-Networking setup and container construction are split into modular host scripts while leaving process supervision, dependency ordering, and namespace management to systemd. `SetCredential=` (introduced in systemd 247) passes declarative parameters from the unit file to the host scripts:
+Networking setup, container construction, and OCI image import are split into modular host scripts while leaving process supervision, dependency ordering, and namespace management to systemd. `SetCredential=` (introduced in systemd 247) passes declarative parameters from the unit file to the host scripts:
 
 1. `host/usr/lib/systemd/pod-net-host-start` configures a pod to share the host network namespace and delegates container setup to `pod-container-start`.
 2. `host/usr/lib/systemd/pod-net-vlan-start` configures an isolated network namespace (`PrivateNetwork=yes`), attaches VLAN or virtual interfaces from `SetCredential=net.if.*`, and delegates container setup to `pod-container-start`.
-3. `host/usr/lib/systemd/pod-container-start` derives the machine name from the systemd unit name, sets the stage 1 hostname to `INVOCATION_ID` (unless `SetCredential=pod.hostname:` is specified), derives a deterministic `/etc/machine-id` per host and unit for persistent journaling across restarts, mounts the per-pod stage 1 overlay, shared `/vol/*` directories, stage 2 application overlays, declarative host bind mounts, and container journal directories, emits native stage 2 `.service` units and drop-ins under `${STAGE1_ROOT}/etc/systemd/system/`, and executes `systemd-nspawn --notify-ready=yes`.
-4. `stage1/etc/systemd/system/pod-stage2-post@.service` and `stage1/usr/lib/systemd/pod-stage2-post` run inside stage 1 after each stage 2 service starts or restarts, stamping each stage 2 private UTS namespace and `/etc/hostname` with its own `InvocationID` and synchronising `/etc/os-release` under `flock` before `pod-idle.target` signals readiness to the host.
+3. `host/usr/lib/systemd/pod-container-start` derives the machine name from the systemd unit name, sets the stage 1 hostname to `INVOCATION_ID` (unless `SetCredential=pod.hostname:` is specified), derives a deterministic `/etc/machine-id` per host and unit for persistent journaling across restarts, mounts the per-pod stage 1 overlay, shared `/vol/*` directories, stage 2 application overlays, declarative host bind mounts, and container journal directories, mirrors stage 2 `User=`, `Group=`, and `SupplementaryGroups=` identities into the ephemeral stage 1 `/etc/passwd` and `/etc/group` (adding `CAP_SETUID` and `CAP_SETGID` when needed), emits native stage 2 `.service` units and drop-ins under `${STAGE1_ROOT}/etc/systemd/system/`, and executes `systemd-nspawn --notify-ready=yes`.
+4. `host/usr/lib/systemd/pod-import-oci` imports unmodified Docker and OCI images from container registries or local archives into `/var/lib/machines/<image>` using `skopeo`, `umoci`, and `jq`, generating `/etc/pod.service` and `/etc/pod-environment`.
+5. `stage1/etc/systemd/system/pod-stage2-post@.service` and `stage1/usr/lib/systemd/pod-stage2-post` run inside stage 1 after each stage 2 service starts or restarts, stamping each stage 2 private UTS namespace and `/etc/hostname` with its own `InvocationID` and synchronising `/etc/os-release` under `flock` before `pod-idle.target` signals readiness to the host.
+6. `stage1/etc/systemd/system/pod-stdio@.service` provides a per-application FIFO bridge to `systemd-journald` so OCI applications that call `open("/dev/stdout")` or `open("/dev/stderr")` (such as `nginx` or `httpd`) do not encounter `ENXIO` on a `journald` stream socket while still streaming all output to the pod journal with `POD_UNIT=` metadata.
 
 ---
 
@@ -23,6 +25,7 @@ Networking setup and container construction are split into modular host scripts 
 │       └── lib
 │           └── systemd
 │               ├── pod-container-start
+│               ├── pod-import-oci
 │               ├── pod-net-host-start
 │               ├── pod-net-start
 │               ├── pod-net-stop
@@ -43,6 +46,7 @@ Networking setup and container construction are split into modular host scripts 
     │           ├── pod-os-release-sync.path
     │           ├── pod-os-release-sync.service
     │           ├── pod-stage2-post@.service
+    │           ├── pod-stdio@.service
     │           ├── systemd-journald-dev-log.socket.d
     │           │   └── 10-no-deps.conf
     │           ├── systemd-journald.service.d
@@ -83,6 +87,7 @@ Copy the files from [`stage1/`](stage1/) into `/var/lib/machines/stage1-debian`:
 * [`stage1/etc/systemd/system/pod-os-release-sync.path`](stage1/etc/systemd/system/pod-os-release-sync.path)
 * [`stage1/etc/systemd/system/pod-os-release-sync.service`](stage1/etc/systemd/system/pod-os-release-sync.service)
 * [`stage1/etc/systemd/system/pod-stage2-post@.service`](stage1/etc/systemd/system/pod-stage2-post@.service)
+* [`stage1/etc/systemd/system/pod-stdio@.service`](stage1/etc/systemd/system/pod-stdio@.service)
 * [`stage1/etc/systemd/system/container-shell@.service.d/10-no-deps.conf`](stage1/etc/systemd/system/container-shell@.service.d/10-no-deps.conf)
 * [`stage1/etc/systemd/system/dbus.socket.d/10-no-deps.conf`](stage1/etc/systemd/system/dbus.socket.d/10-no-deps.conf)
 * [`stage1/etc/systemd/system/dbus.service.d/10-no-deps.conf`](stage1/etc/systemd/system/dbus.service.d/10-no-deps.conf)
@@ -135,9 +140,10 @@ sudo machinectl read-only stage1-debian yes
 
 ## Installing the host scripts
 
-Install the five lifecycle scripts from [`host/usr/lib/systemd/`](host/usr/lib/systemd/) into `/usr/lib/systemd/`:
+Install the six host scripts from [`host/usr/lib/systemd/`](host/usr/lib/systemd/) into `/usr/lib/systemd/`:
 
 * [`host/usr/lib/systemd/pod-container-start`](host/usr/lib/systemd/pod-container-start)
+* [`host/usr/lib/systemd/pod-import-oci`](host/usr/lib/systemd/pod-import-oci)
 * [`host/usr/lib/systemd/pod-net-host-start`](host/usr/lib/systemd/pod-net-host-start)
 * [`host/usr/lib/systemd/pod-net-vlan-start`](host/usr/lib/systemd/pod-net-vlan-start)
 * [`host/usr/lib/systemd/pod-net-start`](host/usr/lib/systemd/pod-net-start)
@@ -146,6 +152,7 @@ Install the five lifecycle scripts from [`host/usr/lib/systemd/`](host/usr/lib/s
 ```sh
 sudo install -m 0755 \
   host/usr/lib/systemd/pod-container-start \
+  host/usr/lib/systemd/pod-import-oci \
   host/usr/lib/systemd/pod-net-host-start \
   host/usr/lib/systemd/pod-net-vlan-start \
   host/usr/lib/systemd/pod-net-start \
@@ -157,21 +164,18 @@ sudo install -m 0755 \
 
 ## Importing a stage 2 application image
 
-Stage 2 images are root filesystem directories stored in `/var/lib/machines/<app>` and marked read-only. To import an Alpine Linux root filesystem as `test-ping`:
-
-```sh
-sudo machinectl import-tar alpine-minirootfs-3.18.4-riscv64.tar.gz test-ping
-```
-
-Each stage 2 application unit is assembled inside stage 1 from three standard `systemd` layers:
+Stage 2 images are root filesystem directories stored in `/var/lib/machines/<app>` and marked read-only. Each stage 2 application unit is assembled inside stage 1 from three standard `systemd` layers:
 
 1. Base unit (`/etc/systemd/system/<app>.service`): runtime defaults (`Type=exec`, `NotifyAccess=all`, `Restart=always`, `RestartSec=2s`, `TimeoutStartSec=30s`, `MountAPIVFS=yes`, `ProtectHostname=yes`, `RootDirectory=/opt/stage2/<app>/rootfs`, `LogExtraFields=POD_UNIT=<machine>`, `Wants=pod-stage2-post@<app>.service`, `Before=pod-idle.target shutdown.target`, `Conflicts=shutdown.target`).
 2. Image drop-in (`10-image.conf`): copied directly from `/var/lib/machines/<image>/etc/pod.service` when present.
 3. Credential drop-in (`20-credential.conf`): generated directly from native `systemd.unit(5)` and `systemd.service(5)` directives in `SetCredential=pod.app.<app>:image=<image>,<Key>=<Value>,...`.
 
-To embed default service settings in `/var/lib/machines/<image>/etc/pod.service` before marking the image read-only:
+### Importing a root filesystem tarball manually
+
+To import an Alpine Linux root filesystem as `test-ping` and embed default service settings in `/var/lib/machines/<image>/etc/pod.service`:
 
 ```sh
+sudo machinectl import-tar alpine-minirootfs-3.18.4-riscv64.tar.gz test-ping
 sudo tee /var/lib/machines/test-ping/etc/pod.service >/dev/null <<'EOF'
 [Service]
 ExecStart=/bin/ping 127.0.0.1
@@ -183,8 +187,57 @@ When `/etc/pod.service` declares `ExecStart=`, `SetCredential=pod.app.ping:test-
 
 * `image=<image>` selects the stage 2 image in `/var/lib/machines/<image>`.
 * `[Unit]` directives (`After=`, `Before=`, `Wants=`, `Requires=`, `BindsTo=`, `PartOf=`, `Conflicts=`, `Condition*=`, `Assert*=`, etc.) are written under `[Unit]` in `20-credential.conf`.
-* `[Service]` directives (`ExecStart=`, `Type=`, `User=`, `Group=`, `BindPaths=`, `BindReadOnlyPaths=`, `CapabilityBoundingSet=`, `AmbientCapabilities=`, `ExecStartPre=`, `ExecStartPost=`, `ExecStopPost=`, `MemoryMax=`, `CPUQuota=`, `TasksMax=`, `SystemCallFilter=`, `Environment=`, `WorkingDirectory=`, etc.) are written under `[Service]` in `20-credential.conf`. `ExecStart=` automatically emits a reset line before the first credential override, and `BindPaths=` and `BindReadOnlyPaths=` pre-create destination mountpoints inside the stage 2 overlay.
-* Pod-wide capabilities passed to `systemd-nspawn` are configured via `SetCredential=pod.caps:CAP_NET_ADMIN,CAP_NET_RAW,...`.
+* `[Service]` directives (`ExecStart=`, `Type=`, `User=`, `Group=`, `SupplementaryGroups=`, `BindPaths=`, `BindReadOnlyPaths=`, `CapabilityBoundingSet=`, `AmbientCapabilities=`, `ExecStartPre=`, `ExecStartPost=`, `ExecStopPost=`, `MemoryMax=`, `CPUQuota=`, `TasksMax=`, `SystemCallFilter=`, `Environment=`, `WorkingDirectory=`, etc.) are written under `[Service]` in `20-credential.conf`. `ExecStart=` automatically emits a reset line before the first credential override, and `BindPaths=` and `BindReadOnlyPaths=` pre-create destination mountpoints inside the stage 2 overlay.
+* Pod-wide capabilities passed to `systemd-nspawn` are configured via `SetCredential=pod.caps:CAP_NET_ADMIN,CAP_NET_RAW,...`. When any stage 2 service specifies `User=`, `Group=`, or `SupplementaryGroups=`, `pod-container-start` mirrors missing numeric or named identities into the ephemeral stage 1 `/etc/passwd` and `/etc/group` and ensures `CAP_SETUID` and `CAP_SETGID` are granted to stage 1.
+
+### Importing unmodified Docker and OCI images with `pod-import-oci`
+
+To run unmodified Docker or OCI images as stage 2 applications, install `skopeo`, `umoci`, and `jq` on the host:
+
+```sh
+sudo apt-get update
+sudo apt-get install -y --no-install-recommends skopeo umoci jq
+```
+
+`pod-import-oci` fetches an OCI or Docker reference (for example `docker://...` or `docker-archive:/path/to/image.tar`), processes OCI layer ordering and `.wh.*` whiteouts via `umoci unpack`, merges `Entrypoint` and `Cmd`, resolves `argv[0]` against the container `PATH`, escapes `systemd` specifiers and quotes, writes `/etc/pod-environment` and `/etc/pod.service` (wired to `pod-stdio@%N.service` so `open("/dev/stdout")` and `open("/dev/stderr")` work cleanly alongside `journald` logging), and marks the image read-only:
+
+```sh
+sudo /usr/lib/systemd/pod-import-oci \
+  docker://docker.io/library/redis:7-alpine \
+  redis-alpine
+
+sudo /usr/lib/systemd/pod-import-oci \
+  docker://docker.io/library/nginx:1.27-alpine \
+  nginx-alpine
+```
+
+Optional flags supported by `pod-import-oci`: `--arch=<arch>`, `--os=<os>`, `--variant=<variant>`, `--creds=<user:pass>`, and `--tls-verify=<bool>`.
+
+Run both imported images side by side in a shared pod (include `CAP_SETUID,CAP_SETGID,CAP_CHOWN,CAP_DAC_OVERRIDE` in `pod.caps` when root-started entrypoints such as `redis` or `nginx` drop privileges with `su-exec` or `gosu`; non-root OCI images such as `nginxinc/nginx-unprivileged` work with a bare `SetCredential=pod.app.nginx:nginx-unpriv-alpine` and no custom `pod.caps`):
+
+```sh
+sudo systemd-run --collect \
+  --unit=pod-webstack.service \
+  --slice=machine.slice \
+  --property=Type=notify \
+  --property=Delegate=yes \
+  --property=PrivateNetwork=yes \
+  --property=PrivateIPC=yes \
+  --property="RuntimeDirectory=pods/%N" \
+  --property="SetCredential=pod.stage1:stage1-debian" \
+  --property="SetCredential=pod.caps:CAP_NET_ADMIN,CAP_NET_RAW,CAP_NET_BIND_SERVICE,CAP_SYS_ADMIN,CAP_SETUID,CAP_SETGID,CAP_CHOWN,CAP_DAC_OVERRIDE" \
+  --property="SetCredential=vol.run:mode=0775,uid=0,gid=0" \
+  --property="SetCredential=pod.app.redis:image=redis-alpine,BindPaths=/vol/run:/run/redis,MemoryMax=128M" \
+  --property="SetCredential=pod.app.nginx:image=nginx-alpine,After=redis.service,BindPaths=/vol/run:/run/redis,MemoryMax=128M" \
+  --property="ExecStopPost=-/usr/lib/systemd/pod-net-stop" \
+  /usr/lib/systemd/pod-net-start
+```
+
+To override the command of an imported OCI image for one pod while preserving its `WorkingDirectory=`, `User=`, `KillSignal=`, and `/etc/pod-environment` defaults, pass `ExecStart=` in the credential:
+
+```sh
+--property="SetCredential=pod.app.redis:image=redis-alpine,ExecStart=/usr/local/bin/docker-entrypoint.sh redis-server --port 6380"
+```
 
 ---
 

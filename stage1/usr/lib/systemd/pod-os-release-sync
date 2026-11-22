@@ -22,7 +22,7 @@ if [ -n "$cgroup_slice" ]; then
         fi
         unit_name="${unit_dir##*/}"
         case "$unit_name" in
-            dbus.service|systemd-*|container-*|pod-os-release-*|pod-stage2-post@*|run-*.service) continue ;;
+            dbus.service|systemd-*|container-*|pod-os-release-*|pod-stage2-post@*|pod-stdio@*|run-*.service) continue ;;
         esac
 
         pid=""

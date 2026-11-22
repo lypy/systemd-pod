@@ -194,13 +194,111 @@ prepare_bind_mountpoints() {
     fi
 }
 
+NEED_SETUID_CAPS=0
+
+ensure_stage1_gid() {
+    g_spec="$1"
+    [ -n "$g_spec" ] || return 0
+    NEED_SETUID_CAPS=1
+    case "$g_spec" in
+        *[!0-9]*)
+            if ! awk -F: -v n="$g_spec" '$1 == n {found=1} END {exit !found}' "${STAGE1_ROOT}/etc/group"; then
+                if [ -f "${app_merged}/etc/group" ]; then
+                    g_line="$(awk -F: -v n="$g_spec" '$1 == n {print; exit}' "${app_merged}/etc/group")"
+                    if [ -n "$g_line" ]; then
+                        printf '%s\n' "$g_line" >> "${STAGE1_ROOT}/etc/group"
+                    fi
+                fi
+            fi
+            ;;
+        *)
+            if ! awk -F: -v id="$g_spec" '$3 == id {found=1} END {exit !found}' "${STAGE1_ROOT}/etc/group"; then
+                printf 'pod-gid-%s:x:%s:\n' "$g_spec" "$g_spec" >> "${STAGE1_ROOT}/etc/group"
+            fi
+            ;;
+    esac
+}
+
+ensure_stage1_uid() {
+    u_spec="$1"
+    [ -n "$u_spec" ] || return 0
+    NEED_SETUID_CAPS=1
+    case "$u_spec" in
+        *[!0-9]*)
+            if ! awk -F: -v n="$u_spec" '$1 == n {found=1} END {exit !found}' "${STAGE1_ROOT}/etc/passwd"; then
+                if [ -f "${app_merged}/etc/passwd" ]; then
+                    u_line="$(awk -F: -v n="$u_spec" '$1 == n {print; exit}' "${app_merged}/etc/passwd")"
+                    if [ -n "$u_line" ]; then
+                        printf '%s\n' "$u_line" >> "${STAGE1_ROOT}/etc/passwd"
+                        u_gid="$(printf '%s' "$u_line" | cut -d: -f4)"
+                        ensure_stage1_gid "$u_gid"
+                    fi
+                fi
+            fi
+            ;;
+        *)
+            if ! awk -F: -v id="$u_spec" '$3 == id {found=1} END {exit !found}' "${STAGE1_ROOT}/etc/passwd"; then
+                u_gid="$u_spec"
+                if [ -f "${app_merged}/etc/passwd" ]; then
+                    found_gid="$(awk -F: -v id="$u_spec" '$3 == id {print $4; exit}' "${app_merged}/etc/passwd")"
+                    if [ -n "$found_gid" ]; then
+                        u_gid="$found_gid"
+                    fi
+                fi
+                printf 'pod-uid-%s:x:%s:%s::/nonexistent:/usr/sbin/nologin\n' "$u_spec" "$u_spec" "$u_gid" >> "${STAGE1_ROOT}/etc/passwd"
+                ensure_stage1_gid "$u_gid"
+            fi
+            ;;
+    esac
+}
+
+ensure_stage1_sup_groups() {
+    sg_list="$1"
+    [ -n "$sg_list" ] || return 0
+    sg_old_ifs="$IFS"
+    case "$-" in
+        *f*) sg_had_noglob=1 ;;
+        *)   sg_had_noglob=0; set -f ;;
+    esac
+    IFS=' '
+    for sg in $sg_list; do
+        ensure_stage1_gid "$sg"
+    done
+    IFS="$sg_old_ifs"
+    if [ "$sg_had_noglob" -eq 0 ]; then
+        set +f
+    fi
+}
+
+sync_stage1_identities_from_file() {
+    cfg_file="$1"
+    [ -f "$cfg_file" ] || return 0
+    while IFS= read -r cfg_line || [ -n "$cfg_line" ]; do
+        case "$cfg_line" in
+            User=*)
+                ensure_stage1_uid "${cfg_line#User=}"
+                ;;
+            Group=*)
+                ensure_stage1_gid "${cfg_line#Group=}"
+                ;;
+            SupplementaryGroups=*)
+                ensure_stage1_sup_groups "${cfg_line#SupplementaryGroups=}"
+                ;;
+        esac
+    done < "$cfg_file"
+}
+
 # 5. Mount each Stage 2 application overlay and emit its native Stage 1 systemd unit
 #    under ${STAGE1_ROOT}/etc/systemd/system/ so Stage 1 boots all Stage 2 units in
 #    one transaction before signalling READY=1 via --notify-ready=yes.
 NSPAWN_APP_BINDS=""
 UNIT_DIR="${STAGE1_ROOT}/etc/systemd/system"
 mkdir -p "${STAGE1_ROOT}/opt/stage2" "${RUN_DIR}/app-rootfs" "${RUN_DIR}/app-upper" "${RUN_DIR}/app-work" \
-         "${UNIT_DIR}/pod-idle.target.wants"
+         "${UNIT_DIR}/pod-idle.target.wants" "${UNIT_DIR}/pod-stdio@.service.d"
+{
+    printf '[Service]\n'
+    printf 'LogExtraFields=POD_UNIT=%s\n' "${MACHINE_NAME}"
+} > "${UNIT_DIR}/pod-stdio@.service.d/10-pod-unit.conf"
 
 for cred in "${CRED_DIR}"/pod.app.*; do
     if [ ! -f "$cred" ]; then
@@ -337,6 +435,7 @@ EOF
     # Layer 10: Stage 2 image defaults from /etc/pod.service
     if [ -f "${img_dir}/etc/pod.service" ]; then
         cp "${img_dir}/etc/pod.service" "${dropin_dir}/10-image.conf"
+        sync_stage1_identities_from_file "${dropin_dir}/10-image.conf"
     fi
 
     # Layer 20: Per-pod credential overrides from SetCredential=pod.app.<app_id>
@@ -349,6 +448,7 @@ EOF
                 printf '[Service]\n%s' "${svc_lines}"
             fi
         } > "${dropin_dir}/20-credential.conf"
+        sync_stage1_identities_from_file "${dropin_dir}/20-credential.conf"
     fi
 
     ln -sf "../${app_id}.service" "${UNIT_DIR}/pod-idle.target.wants/${app_id}.service"
@@ -385,6 +485,15 @@ if [ -f "${CRED_DIR}/pod.caps" ]; then
                 ;;
         esac
     fi
+fi
+
+if [ "$NEED_SETUID_CAPS" -eq 1 ]; then
+    for req_cap in CAP_SETUID CAP_SETGID; do
+        case ",${POD_CAPS}," in
+            *,"${req_cap}",*) ;;
+            *) POD_CAPS="${POD_CAPS},${req_cap}" ;;
+        esac
+    done
 fi
 
 export SYSTEMD_NSPAWN_LOCK=0

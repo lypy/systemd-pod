@@ -16,7 +16,7 @@ if [ -z "${POD_STAGE1_STAY:-}" ]; then
             fi
             _pod_unit_name="${_pod_unit_dir##*/}"
             case "$_pod_unit_name" in
-                dbus.service|systemd-*|container-*|pod-os-release-*|pod-stage2-post@*|run-*.service) continue ;;
+                dbus.service|systemd-*|container-*|pod-os-release-*|pod-stage2-post@*|pod-stdio@*|run-*.service) continue ;;
             esac
 
             _pod_pid=""
