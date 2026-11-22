@@ -4,6 +4,11 @@ set -eu
 CRED_DIR="${CREDENTIALS_DIRECTORY:-/run/credentials}"
 RUN_DIR="${RUNTIME_DIRECTORY:-}"
 
+if [ ! -d "$CRED_DIR" ]; then
+    echo "Credentials directory ${CRED_DIR} not accessible" >&2
+    exit 1
+fi
+
 if [ -z "$RUN_DIR" ] || [ ! -f "${RUN_DIR}/machine-name" ]; then
     echo "Missing machine-name in RUNTIME_DIRECTORY" >&2
     exit 1
@@ -11,35 +16,10 @@ fi
 
 MACHINE_NAME="$(tr -d ' \t\r\n' < "${RUN_DIR}/machine-name")"
 
-STAGE1_IMAGE="stage1-debian"
-if [ -f "${CRED_DIR}/pod.stage1" ]; then
-    STAGE1_IMAGE="$(tr -d ' \t\r\n' < "${CRED_DIR}/pod.stage1")"
-fi
-STAGE1_LOWER="/var/lib/machines/${STAGE1_IMAGE}"
-
-is_file_bind_src() {
-    bind_src="$1"
-    if [ -f "${RUN_DIR}/stage1-upper${bind_src}" ] || [ -f "${STAGE1_LOWER}${bind_src}" ]; then
-        return 0
+read_first_line() {
+    if [ -f "$1" ]; then
+        tr -d '\r\n' < "$1"
     fi
-    if [ -d "${RUN_DIR}/stage1-upper${bind_src}" ] || [ -d "${STAGE1_LOWER}${bind_src}" ]; then
-        return 1
-    fi
-    case "$bind_src" in
-        /vol/*)
-            vol_rel="${bind_src#/vol/}"
-            if [ -f "${RUN_DIR}/vol/${vol_rel}" ]; then
-                return 0
-            fi
-            if [ -d "${RUN_DIR}/vol/${vol_rel}" ]; then
-                return 1
-            fi
-            ;;
-    esac
-    if [ -f "$bind_src" ]; then
-        return 0
-    fi
-    return 1
 }
 
 start_app_cred() {
@@ -48,14 +28,6 @@ start_app_cred() {
     spec="$(tr -d '\r\n' < "$cred")"
 
     image_name=""
-    exec_cmd=""
-    has_type=0
-    has_user=0
-    has_group=0
-    has_wd=0
-    has_caps=0
-    set --
-
     case "$spec" in
         *=*)
             old_ifs="$IFS"
@@ -63,11 +35,9 @@ start_app_cred() {
             for pair in $spec; do
                 k="${pair%%=*}"
                 v="${pair#*=}"
-                case "$k" in
-                    image)
-                        image_name="$v"
-                        ;;
-                esac
+                if [ "$k" = "image" ]; then
+                    image_name="$v"
+                fi
             done
             IFS="$old_ifs"
             ;;
@@ -83,15 +53,14 @@ start_app_cred() {
 
     img_dir="/var/lib/machines/${image_name}"
 
-    if [ -f "${img_dir}/etc/pod-environment" ]; then
-        while IFS= read -r env_line || [ -n "$env_line" ]; do
-            env_line="$(printf '%s' "$env_line" | tr -d '\r')"
-            case "$env_line" in
-                ""|\#*) continue ;;
-                *=*) set -- "$@" --property="Environment=${env_line}" ;;
-            esac
-        done < "${img_dir}/etc/pod-environment"
-    fi
+    exec_cmd="$(read_first_line "${img_dir}/etc/pod-entrypoint")"
+    svc_type="$(read_first_line "${img_dir}/etc/pod-type" | tr -d ' \t')"
+    svc_user="$(read_first_line "${img_dir}/etc/pod-user" | tr -d ' \t')"
+    svc_group="$(read_first_line "${img_dir}/etc/pod-group" | tr -d ' \t')"
+    svc_wd="$(read_first_line "${img_dir}/etc/pod-wd" | tr -d ' \t')"
+    svc_caps="$(read_first_line "${img_dir}/etc/pod-caps")"
+
+    set -- --property="EnvironmentFile=-/opt/stage2/${app_id}/rootfs/etc/pod-environment"
 
     case "$spec" in
         *=*)
@@ -101,77 +70,27 @@ start_app_cred() {
                 k="${pair%%=*}"
                 v="${pair#*=}"
                 case "$k" in
-                    exec)
-                        exec_cmd="$v"
-                        ;;
-                    type)
-                        has_type=1
-                        set -- "$@" --property="Type=${v}"
-                        if [ "$v" = "notify" ] || [ "$v" = "notify-reload" ]; then
-                            set -- "$@" --property=NotifyAccess=all
-                        fi
-                        ;;
-                    bind)
-                        set -- "$@" --property="BindPaths=${v}"
-                        ;;
-                    bind_ro)
-                        set -- "$@" --property="BindReadOnlyPaths=${v}"
-                        ;;
-                    after)
-                        set -- "$@" --property="After=${v}"
-                        ;;
-                    user)
-                        has_user=1
-                        set -- "$@" --property="User=${v}"
-                        ;;
-                    group)
-                        has_group=1
-                        set -- "$@" --property="Group=${v}"
-                        ;;
-                    sup_groups)
-                        set -- "$@" --property="SupplementaryGroups=${v}"
-                        ;;
-                    caps)
-                        has_caps=1
-                        set -- "$@" --property="CapabilityBoundingSet=${v}"
-                        ;;
-                    ambient_caps)
-                        set -- "$@" --property="AmbientCapabilities=${v}"
-                        ;;
-                    exec_pre)
-                        set -- "$@" --property="ExecStartPre=${v}"
-                        ;;
-                    exec_post)
-                        set -- "$@" --property="ExecStartPost=${v}"
-                        ;;
-                    exec_stop)
-                        set -- "$@" --property="ExecStopPost=${v}"
-                        ;;
-                    memory_max)
-                        set -- "$@" --property="MemoryMax=${v}"
-                        ;;
-                    memory_high)
-                        set -- "$@" --property="MemoryHigh=${v}"
-                        ;;
-                    cpu_quota)
-                        set -- "$@" --property="CPUQuota=${v}"
-                        ;;
-                    cpu_weight)
-                        set -- "$@" --property="CPUWeight=${v}"
-                        ;;
-                    tasks_max)
-                        set -- "$@" --property="TasksMax=${v}"
-                        ;;
-                    syscall_filter)
-                        set -- "$@" --property="SystemCallFilter=${v}"
-                        ;;
-                    env)
-                        set -- "$@" --property="Environment=${v}"
-                        ;;
-                    wd)
-                        has_wd=1
-                        set -- "$@" --property="WorkingDirectory=${v}"
-                        ;;
+                    exec)           exec_cmd="$v" ;;
+                    type)           svc_type="$v" ;;
+                    user)           svc_user="$v" ;;
+                    group)          svc_group="$v" ;;
+                    wd)             svc_wd="$v" ;;
+                    caps)           svc_caps="$v" ;;
+                    bind)           set -- "$@" --property="BindPaths=${v}" ;;
+                    bind_ro)        set -- "$@" --property="BindReadOnlyPaths=${v}" ;;
+                    after)          set -- "$@" --property="After=${v}" ;;
+                    sup_groups)     set -- "$@" --property="SupplementaryGroups=${v}" ;;
+                    ambient_caps)   set -- "$@" --property="AmbientCapabilities=${v}" ;;
+                    exec_pre)       set -- "$@" --property="ExecStartPre=${v}" ;;
+                    exec_post)      set -- "$@" --property="ExecStartPost=${v}" ;;
+                    exec_stop)      set -- "$@" --property="ExecStopPost=${v}" ;;
+                    memory_max)     set -- "$@" --property="MemoryMax=${v}" ;;
+                    memory_high)    set -- "$@" --property="MemoryHigh=${v}" ;;
+                    cpu_quota)      set -- "$@" --property="CPUQuota=${v}" ;;
+                    cpu_weight)     set -- "$@" --property="CPUWeight=${v}" ;;
+                    tasks_max)      set -- "$@" --property="TasksMax=${v}" ;;
+                    syscall_filter) set -- "$@" --property="SystemCallFilter=${v}" ;;
+                    env)            set -- "$@" --property="Environment=${v}" ;;
                 esac
             done
             IFS="$old_ifs"
@@ -179,83 +98,27 @@ start_app_cred() {
     esac
 
     if [ -z "$exec_cmd" ]; then
-        entrypoint_file="${img_dir}/etc/pod-entrypoint"
-        if [ -f "$entrypoint_file" ]; then
-            exec_cmd="$(tr -d '\r\n' < "$entrypoint_file")"
-        else
-            echo "No exec= specified in ${cred} and no /etc/pod-entrypoint found in ${img_dir}" >&2
-            exit 1
-        fi
+        echo "No exec= specified in ${cred} and no /etc/pod-entrypoint found in ${img_dir}" >&2
+        exit 1
     fi
 
-    if [ "$has_type" -eq 0 ] && [ -f "${img_dir}/etc/pod-type" ]; then
-        img_type="$(tr -d ' \t\r\n' < "${img_dir}/etc/pod-type")"
-        if [ -n "$img_type" ]; then
-            set -- "$@" --property="Type=${img_type}"
-            if [ "$img_type" = "notify" ] || [ "$img_type" = "notify-reload" ]; then
-                set -- "$@" --property=NotifyAccess=all
-            fi
+    if [ -n "$svc_type" ]; then
+        set -- "$@" --property="Type=${svc_type}"
+        if [ "$svc_type" = "notify" ] || [ "$svc_type" = "notify-reload" ]; then
+            set -- "$@" --property=NotifyAccess=all
         fi
     fi
-
-    if [ "$has_user" -eq 0 ] && [ -f "${img_dir}/etc/pod-user" ]; then
-        img_user="$(tr -d ' \t\r\n' < "${img_dir}/etc/pod-user")"
-        if [ -n "$img_user" ]; then
-            set -- "$@" --property="User=${img_user}"
-        fi
+    if [ -n "$svc_user" ]; then
+        set -- "$@" --property="User=${svc_user}"
     fi
-
-    if [ "$has_group" -eq 0 ] && [ -f "${img_dir}/etc/pod-group" ]; then
-        img_group="$(tr -d ' \t\r\n' < "${img_dir}/etc/pod-group")"
-        if [ -n "$img_group" ]; then
-            set -- "$@" --property="Group=${img_group}"
-        fi
+    if [ -n "$svc_group" ]; then
+        set -- "$@" --property="Group=${svc_group}"
     fi
-
-    if [ "$has_wd" -eq 0 ] && [ -f "${img_dir}/etc/pod-wd" ]; then
-        img_wd="$(tr -d ' \t\r\n' < "${img_dir}/etc/pod-wd")"
-        if [ -n "$img_wd" ]; then
-            set -- "$@" --property="WorkingDirectory=${img_wd}"
-        fi
+    if [ -n "$svc_wd" ]; then
+        set -- "$@" --property="WorkingDirectory=${svc_wd}"
     fi
-
-    if [ "$has_caps" -eq 0 ] && [ -f "${img_dir}/etc/pod-caps" ]; then
-        img_caps="$(tr -d '\r\n' < "${img_dir}/etc/pod-caps")"
-        if [ -n "$img_caps" ]; then
-            set -- "$@" --property="CapabilityBoundingSet=${img_caps}"
-        fi
-    fi
-
-    app_upper="${RUN_DIR}/app-upper/${app_id}"
-    if [ -d "$app_upper" ]; then
-        case "$spec" in
-            *=*)
-                old_ifs="$IFS"
-                IFS=','
-                for pair in $spec; do
-                    k="${pair%%=*}"
-                    v="${pair#*=}"
-                    case "$k" in
-                        bind|bind_ro)
-                            src="${v%%:*}"
-                            dst="${v#*:}"
-                            dst="${dst%%:*}"
-                            if [ -n "$dst" ]; then
-                                if [ -f "${app_upper}${dst}" ] || [ -f "${img_dir}${dst}" ] || is_file_bind_src "$src"; then
-                                    mkdir -p "${app_upper}${dst%/*}"
-                                    if [ ! -f "${img_dir}${dst}" ]; then
-                                        touch "${app_upper}${dst}"
-                                    fi
-                                else
-                                    mkdir -p "${app_upper}${dst}"
-                                fi
-                            fi
-                            ;;
-                    esac
-                done
-                IFS="$old_ifs"
-                ;;
-        esac
+    if [ -n "$svc_caps" ]; then
+        set -- "$@" --property="CapabilityBoundingSet=${svc_caps}"
     fi
 
     # shellcheck disable=SC2086
@@ -265,6 +128,8 @@ start_app_cred() {
         --property=Restart=always \
         --property=RestartSec=2s \
         --property=MountAPIVFS=yes \
+        --property=ProtectHostname=yes \
+        --property="LogExtraFields=POD_UNIT=${MACHINE_NAME}" \
         --property="RootDirectory=/opt/stage2/${app_id}/rootfs" \
         "$@" \
         $exec_cmd
@@ -346,4 +211,3 @@ for cred in "${CRED_DIR}"/pod.app.*; do
 done
 
 /usr/bin/systemctl --machine="${MACHINE_NAME}" restart pod-os-release-sync.service 2>/dev/null || true
-

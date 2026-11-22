@@ -1,5 +1,6 @@
 if [ -z "${POD_STAGE1_STAY:-}" ]; then
     _pod_target_pid=""
+    _pod_target_unit=""
     _pod_active_count=0
     _pod_cgroup_slice=""
 
@@ -8,8 +9,6 @@ if [ -z "${POD_STAGE1_STAY:-}" ]; then
     elif [ -d /sys/fs/cgroup/systemd/system.slice ]; then
         _pod_cgroup_slice="/sys/fs/cgroup/systemd/system.slice"
     fi
-
-    _pod_stage1_root="$(stat -Lc '%d:%i' / 2>/dev/null || true)"
 
     if [ -n "$_pod_cgroup_slice" ]; then
         for _pod_unit_dir in "${_pod_cgroup_slice}"/*.service; do
@@ -25,52 +24,44 @@ if [ -z "${POD_STAGE1_STAY:-}" ]; then
             if [ -r "${_pod_unit_dir}/cgroup.procs" ]; then
                 IFS= read -r _pod_pid < "${_pod_unit_dir}/cgroup.procs" 2>/dev/null || true
             fi
-            if [ -z "$_pod_pid" ] || [ ! -e "/proc/${_pod_pid}/root" ]; then
+            if [ -z "$_pod_pid" ] || [ ! -e "/proc/${_pod_pid}/root" ] || [ "/proc/${_pod_pid}/root" -ef / ]; then
                 continue
-            fi
-
-            _pod_proc_root="$(stat -Lc '%d:%i' "/proc/${_pod_pid}/root" 2>/dev/null || true)"
-            if [ -z "$_pod_proc_root" ] || [ "$_pod_proc_root" = "$_pod_stage1_root" ]; then
-                continue
-            fi
-
-            _pod_app_id=""
-            _pod_cand="${_pod_unit_name%.service}"
-            if [ -d "/opt/stage2/${_pod_cand}/rootfs" ]; then
-                _pod_cand_root="$(stat -Lc '%d:%i' "/opt/stage2/${_pod_cand}/rootfs" 2>/dev/null || true)"
-                if [ "$_pod_cand_root" = "$_pod_proc_root" ]; then
-                    _pod_app_id="$_pod_cand"
-                fi
-            fi
-
-            if [ -z "$_pod_app_id" ]; then
-                for _pod_stage2_dir in /opt/stage2/*/rootfs; do
-                    if [ ! -d "$_pod_stage2_dir" ]; then
-                        continue
-                    fi
-                    _pod_cand_root="$(stat -Lc '%d:%i' "$_pod_stage2_dir" 2>/dev/null || true)"
-                    if [ "$_pod_cand_root" = "$_pod_proc_root" ]; then
-                        _pod_tmp="${_pod_stage2_dir#/opt/stage2/}"
-                        _pod_app_id="${_pod_tmp%/rootfs}"
-                        break
-                    fi
-                done
             fi
 
             if [ -n "${POD_APP:-}" ]; then
-                if [ "$_pod_unit_name" = "${POD_APP}.service" ] || [ "$_pod_unit_name" = "pod-app-${POD_APP}.service" ] || [ "$_pod_unit_name" = "${POD_APP}" ] || { [ -n "$_pod_app_id" ] && [ "$_pod_app_id" = "${POD_APP}" ]; }; then
+                _pod_match=0
+                case "$_pod_unit_name" in
+                    "${POD_APP}"|"${POD_APP}.service"|"pod-app-${POD_APP}.service") _pod_match=1 ;;
+                esac
+                if [ "$_pod_match" -eq 0 ] && [ -d "/opt/stage2/${POD_APP}/rootfs" ] && [ "/proc/${_pod_pid}/root" -ef "/opt/stage2/${POD_APP}/rootfs" ]; then
+                    _pod_match=1
+                fi
+                if [ "$_pod_match" -eq 1 ]; then
                     _pod_target_pid="$_pod_pid"
+                    _pod_target_unit="$_pod_unit_name"
                     _pod_active_count=1
                     break
                 fi
             else
                 _pod_target_pid="$_pod_pid"
+                _pod_target_unit="$_pod_unit_name"
                 _pod_active_count=$((_pod_active_count + 1))
             fi
         done
     fi
 
     if [ "$_pod_active_count" -eq 1 ] && [ -n "$_pod_target_pid" ]; then
+        if [ -e "/proc/${_pod_target_pid}/ns/uts" ] && [ ! "/proc/${_pod_target_pid}/ns/uts" -ef /proc/1/ns/uts ]; then
+            _pod_cur_host="$(/usr/bin/nsenter --target="$_pod_target_pid" --uts uname -n 2>/dev/null || true)"
+            _pod_s1_host="$(uname -n)"
+            if [ -z "$_pod_cur_host" ] || [ "$_pod_cur_host" = "$_pod_s1_host" ]; then
+                _pod_app_inv="$(systemctl show -p InvocationID --value "$_pod_target_unit" 2>/dev/null || true)"
+                if [ -n "$_pod_app_inv" ]; then
+                    /usr/bin/nsenter --target="$_pod_target_pid" --uts /bin/hostname "$_pod_app_inv" 2>/dev/null || true
+                fi
+            fi
+        fi
+
         export POD_STAGE1_STAY=1
         if [ -x "/proc/${_pod_target_pid}/root/bin/bash" ]; then
             _pod_target_shell=/bin/bash
@@ -80,7 +71,7 @@ if [ -z "${POD_STAGE1_STAY:-}" ]; then
         exec /usr/bin/nsenter --target="$_pod_target_pid" --mount --uts --ipc --net --pid --root --wd "$_pod_target_shell" -l
     fi
 
-    unset _pod_target_pid _pod_active_count _pod_cgroup_slice _pod_stage1_root \
-          _pod_unit_dir _pod_unit_name _pod_pid _pod_proc_root _pod_app_id \
-          _pod_cand _pod_cand_root _pod_stage2_dir _pod_tmp _pod_target_shell
+    unset _pod_target_pid _pod_target_unit _pod_active_count _pod_cgroup_slice \
+          _pod_unit_dir _pod_unit_name _pod_pid _pod_match _pod_cur_host \
+          _pod_s1_host _pod_app_inv _pod_target_shell
 fi

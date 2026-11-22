@@ -3,29 +3,37 @@ set -eu
 
 CRED_DIR="${CREDENTIALS_DIRECTORY:-/run/credentials}"
 
-# 1. Resolve or generate dynamic UUID and identifiers
-if [ -n "${POD_UUID:-}" ]; then
-    POD_UUID="${POD_UUID#pod-}"
-elif [ -f "${CRED_DIR}/pod.uuid" ]; then
-    POD_UUID="$(tr -d ' \t\r\n' < "${CRED_DIR}/pod.uuid")"
-    POD_UUID="${POD_UUID#pod-}"
-else
-    POD_UUID="$(systemd-id128 new --uuid)"
+# 1. Resolve unit-derived machine name, invocation hostname, and deterministic machine ID
+INVOCATION_ID="${INVOCATION_ID:-$(systemd-id128 new)}"
+
+UNIT_PREFIX=""
+if [ -r /proc/self/cgroup ]; then
+    UNIT_PREFIX="$(sed -n 's|.*/\([^/]*\)\.service\(/.*\)\{0,1\}$|\1|p' /proc/self/cgroup | head -n 1)"
+fi
+if [ -z "$UNIT_PREFIX" ] && [ -n "${RUNTIME_DIRECTORY:-}" ]; then
+    UNIT_PREFIX="${RUNTIME_DIRECTORY##*/}"
 fi
 
-MACHINE_NAME="pod-${POD_UUID}"
-POD_MACHINE_ID="$(printf '%s' "${POD_UUID}" | tr -d '-' | tr '[:upper:]' '[:lower:]')"
+MACHINE_NAME="$(printf '%s' "${UNIT_PREFIX}" | tr -c 'A-Za-z0-9.-' '-' | sed 's/^[.-]*//; s/[.-]*$//' | cut -c1-64 | sed 's/[.-]*$//')"
+if [ -z "$MACHINE_NAME" ]; then
+    MACHINE_NAME="pod-${INVOCATION_ID}"
+fi
 
+HOST_MACHINE_ID="$(tr -d ' \t\r\n' < /etc/machine-id)"
+POD_MACHINE_ID="$(printf '%s:%s' "${HOST_MACHINE_ID}" "${MACHINE_NAME}" | sha256sum | cut -c1-32)"
+
+POD_HOSTNAME=""
 if [ -f "${CRED_DIR}/pod.hostname" ]; then
     POD_HOSTNAME="$(tr -d ' \t\r\n' < "${CRED_DIR}/pod.hostname")"
-else
-    POD_HOSTNAME="${MACHINE_NAME}"
+fi
+if [ -z "$POD_HOSTNAME" ]; then
+    POD_HOSTNAME="${INVOCATION_ID}"
 fi
 
-RUN_DIR="${RUNTIME_DIRECTORY:-/run/pods/${POD_UUID}}"
+RUN_DIR="${RUNTIME_DIRECTORY:-/run/pods/${MACHINE_NAME}}"
 mkdir -p -m 0755 "${RUN_DIR}"
 printf '%s\n' "${MACHINE_NAME}" > "${RUN_DIR}/machine-name"
-printf '%s\n' "${POD_UUID}" > "${RUN_DIR}/uuid"
+printf '%s\n' "${INVOCATION_ID}" > "${RUN_DIR}/invocation-id"
 
 STAGE1_IMAGE="stage1-debian"
 if [ -f "${CRED_DIR}/pod.stage1" ]; then
@@ -227,19 +235,18 @@ for cred in "${CRED_DIR}"/pod.app.*; do
 done
 
 # 6. Wire journal directory bindings for journalctl -M and journalctl -m
-HOST_MACHINE_ID="$(tr -d ' \t\r\n' < /etc/machine-id)"
 NSPAWN_JOURNAL_BINDS=""
 
-nsenter --mount=/proc/1/ns/mnt -- mkdir -p "/run/log/journal/${HOST_MACHINE_ID}.${POD_UUID}"
-nsenter --mount=/proc/1/ns/mnt -- ln -sfn "${HOST_MACHINE_ID}.${POD_UUID}" "/run/log/journal/${POD_MACHINE_ID}"
+nsenter --mount=/proc/1/ns/mnt -- mkdir -p "/run/log/journal/${HOST_MACHINE_ID}.${MACHINE_NAME}"
+nsenter --mount=/proc/1/ns/mnt -- ln -sfn "${HOST_MACHINE_ID}.${MACHINE_NAME}" "/run/log/journal/${POD_MACHINE_ID}"
 mkdir -p "${STAGE1_ROOT}/run/log/journal/${POD_MACHINE_ID}"
-NSPAWN_JOURNAL_BINDS="--bind=/run/log/journal/${HOST_MACHINE_ID}.${POD_UUID}:/run/log/journal/${POD_MACHINE_ID}"
+NSPAWN_JOURNAL_BINDS="--bind=/run/log/journal/${HOST_MACHINE_ID}.${MACHINE_NAME}:/run/log/journal/${POD_MACHINE_ID}"
 
 if [ -d /var/log/journal ]; then
-    nsenter --mount=/proc/1/ns/mnt -- mkdir -p "/var/log/journal/${HOST_MACHINE_ID}.${POD_UUID}"
-    nsenter --mount=/proc/1/ns/mnt -- ln -sfn "${HOST_MACHINE_ID}.${POD_UUID}" "/var/log/journal/${POD_MACHINE_ID}"
+    nsenter --mount=/proc/1/ns/mnt -- mkdir -p "/var/log/journal/${HOST_MACHINE_ID}.${MACHINE_NAME}"
+    nsenter --mount=/proc/1/ns/mnt -- ln -sfn "${HOST_MACHINE_ID}.${MACHINE_NAME}" "/var/log/journal/${POD_MACHINE_ID}"
     mkdir -p "${STAGE1_ROOT}/var/log/journal/${POD_MACHINE_ID}"
-    NSPAWN_JOURNAL_BINDS="${NSPAWN_JOURNAL_BINDS} --bind=/var/log/journal/${HOST_MACHINE_ID}.${POD_UUID}:/var/log/journal/${POD_MACHINE_ID}"
+    NSPAWN_JOURNAL_BINDS="${NSPAWN_JOURNAL_BINDS} --bind=/var/log/journal/${HOST_MACHINE_ID}.${MACHINE_NAME}:/var/log/journal/${POD_MACHINE_ID}"
 fi
 
 # 7. Resolve Stage 1 capabilities and disable image lock / seccomp filtering
@@ -267,6 +274,7 @@ exec /usr/bin/systemd-nspawn \
     --quiet \
     --keep-unit \
     --boot \
+    --notify-ready=yes \
     --register=yes \
     --link-journal=no \
     --capability="${POD_CAPS}" \

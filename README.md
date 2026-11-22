@@ -7,10 +7,10 @@ A shared read-only stage 1 image (`/var/lib/machines/stage1-debian`) provides th
 Networking setup, container construction, and application dispatch are split into modular host scripts while leaving process supervision and namespace management to systemd. `SetCredential=` (introduced in systemd 247) passes declarative parameters from the unit file to the host scripts:
 
 1. `host/usr/lib/systemd/pod-net-host-start` configures a pod to share the host network namespace and delegates container setup to `pod-container-start`.
-2. `host/usr/lib/systemd/pod-net-vlan-start` configures an isolated network namespace (`PrivateNetwork=yes`), binds `/run/netns/${POD_UUID}`, attaches VLAN or virtual interfaces from `SetCredential=net.if.*`, and delegates container setup to `pod-container-start`.
-3. `host/usr/lib/systemd/pod-container-start` mounts the per-pod stage 1 overlay, shared `/vol/*` directories, stage 2 application overlays, declarative host bind mounts, and container journal directories before executing `systemd-nspawn`.
-4. `host/usr/lib/systemd/pod-wait-ready` waits until the inner stage 1 D-Bus socket is ready to accept connections.
-5. `host/usr/lib/systemd/pod-apps-start` reads `SetCredential=pod.app.*` definitions and launches each stage 2 application inside the pod via `systemd-run --machine`.
+2. `host/usr/lib/systemd/pod-net-vlan-start` configures an isolated network namespace (`PrivateNetwork=yes`), attaches VLAN or virtual interfaces from `SetCredential=net.if.*`, and delegates container setup to `pod-container-start`.
+3. `host/usr/lib/systemd/pod-container-start` derives the machine name from the systemd unit name, sets the container hostname to `INVOCATION_ID` (unless `SetCredential=pod.hostname:` is specified), derives a deterministic `/etc/machine-id` per host and unit for persistent journaling across restarts, mounts the per-pod stage 1 overlay, shared `/vol/*` directories, stage 2 application overlays, declarative host bind mounts, and container journal directories before executing `systemd-nspawn --notify-ready=yes`.
+4. `host/usr/lib/systemd/pod-wait-ready` verifies the inner stage 1 D-Bus socket is ready to accept connections (returning immediately when `systemd-nspawn --notify-ready=yes` is used, and also ensuring `pod-apps-start` runs as the second `ExecStartPost=` to avoid a systemd 252 bug where the first `ExecStartPost=` masks `/run/credentials` when `PrivateIPC=yes` and `SetCredential=` are combined).
+5. `host/usr/lib/systemd/pod-apps-start` reads `SetCredential=pod.app.*` definitions and launches each stage 2 application inside the pod via `systemd-run --machine` with `ProtectHostname=yes` (so each stage 2 overlay receives its own UTS namespace and distinct stage 2 `InvocationID` hostname) and `LogExtraFields=POD_UNIT=<machine>`.
 
 ---
 
@@ -193,25 +193,20 @@ Stage 2 images can also embed optional default files in `/etc/` (`pod-type`, `po
 
 ## Running a pod with host networking
 
-When a pod runs with `PrivateNetwork=no`, `pod-net-host-start` (or `pod-net-start`) sets `NSPAWN_NET_ARGS=""` and invokes `pod-container-start`. After `pod-wait-ready` confirms the stage 1 D-Bus socket is active, `pod-apps-start` launches each `pod.app.*` credential inside the pod automatically.
+When a pod runs with `PrivateNetwork=no`, `pod-net-host-start` (or `pod-net-start`) invokes `pod-container-start`. `systemd-run` generates a unique `run-r<32hex>.service` unit name automatically when `--unit=` is omitted; `RuntimeDirectory=pods/%N` allocates `/run/pods/<unit-name>`, `systemd-nspawn --notify-ready=yes` signals readiness once stage 1 finishes booting `pod-idle.target`, and `pod-apps-start` launches each `pod.app.*` credential inside the pod.
 
 ```sh
-POD_UUID="$(systemd-id128 new --uuid)"
-
 sudo systemd-run --collect \
-  --unit="pod-${POD_UUID}.service" \
   --slice=machine.slice \
   --property=Type=notify \
   --property=Delegate=yes \
   --property=PrivateNetwork=no \
   --property=PrivateIPC=yes \
-  --property="RuntimeDirectory=pods/${POD_UUID}" \
-  --property="SetCredential=pod.uuid:${POD_UUID}" \
+  --property="RuntimeDirectory=pods/%N" \
   --property="SetCredential=pod.stage1:stage1-debian" \
   --property="SetCredential=pod.app.ping:image=test-ping,exec=/bin/ping 127.0.0.1" \
   --property="ExecStartPost=/usr/lib/systemd/pod-wait-ready" \
   --property="ExecStartPost=/usr/lib/systemd/pod-apps-start" \
-  --property="ExecStopPost=-/usr/lib/systemd/pod-net-stop" \
   /usr/lib/systemd/pod-net-host-start
 ```
 
@@ -219,41 +214,30 @@ sudo systemd-run --collect \
 
 ## Running a pod with private networking and a VLAN-assigned NIC
 
-When a pod runs with `PrivateNetwork=yes`, `systemd` allocates a new network namespace before executing `pod-net-vlan-start` (or `pod-net-start`). `pod-net-vlan-start` performs three steps before handing off to `pod-container-start`:
-
-1. It bind-mounts the service network namespace (`/proc/$$/ns/net`) onto `/run/netns/${POD_UUID}` in the host mount namespace and exports `NSPAWN_NET_ARGS="--network-namespace-path=/run/netns/${POD_UUID}"`.
-2. It brings up the loopback interface (`lo`) inside the pod network namespace.
-3. For each `SetCredential=net.if.<name>:ifname=<ifname>,master=<master>,kind=vlan,vlan_id=<id>[,addr=<cidr>][,gw=<ip>]` credential, it enters the host network namespace (`nsenter --net=/proc/1/ns/net`), creates an 802.1Q VLAN sub-interface linked to the host `master` NIC inside the pod network namespace (`netns "$$"`), brings the interface up, and applies any optional IPv4/IPv6 address and default route before starting the stage 1 container and stage 2 applications. Point-to-point or bridged virtual Ethernet pairs are also supported via `kind=veth,peer=<host_veth>[,master=<bridge>]`.
+When a pod runs with `PrivateNetwork=yes`, `systemd` allocates a new network namespace before executing `pod-net-vlan-start` (or `pod-net-start`). `pod-net-vlan-start` brings up `lo` inside the pod network namespace and creates each `SetCredential=net.if.<name>:ifname=<ifname>,master=<master>,kind=vlan,vlan_id=<id>[,addr=<cidr>][,gw=<ip>]` interface (or `kind=veth,peer=<host_veth>[,master=<bridge>]`) from the host network namespace (`nsenter --net=/proc/1/ns/net`) before execing `pod-container-start`. `systemd-nspawn` inherits that private network namespace directly, and the kernel destroys the network namespace, its virtual interfaces, and the private mount namespace overlays automatically when the pod exits.
 
 ```sh
-POD_UUID="$(systemd-id128 new --uuid)"
-
 sudo systemd-run --collect \
-  --unit="pod-${POD_UUID}.service" \
   --slice=machine.slice \
   --property=Type=notify \
   --property=Delegate=yes \
   --property=PrivateNetwork=yes \
   --property=PrivateIPC=yes \
-  --property="RuntimeDirectory=pods/${POD_UUID}" \
-  --property="SetCredential=pod.uuid:${POD_UUID}" \
+  --property="RuntimeDirectory=pods/%N" \
   --property="SetCredential=pod.stage1:stage1-debian" \
   --property="SetCredential=net.dns:1.1.1.1,8.8.8.8" \
   --property="SetCredential=net.if.vlan100:ifname=eth0,master=enp1s0,kind=vlan,vlan_id=100,addr=192.0.2.10/24,gw=192.0.2.1" \
   --property="SetCredential=pod.app.ping:image=test-ping,exec=/bin/ping 192.0.2.1" \
   --property="ExecStartPost=/usr/lib/systemd/pod-wait-ready" \
   --property="ExecStartPost=/usr/lib/systemd/pod-apps-start" \
-  --property="ExecStopPost=-/usr/lib/systemd/pod-net-stop" \
   /usr/lib/systemd/pod-net-vlan-start
 ```
-
-When the pod stops, `ExecStopPost=-/usr/lib/systemd/pod-net-stop` unmounts and removes `/run/netns/${POD_UUID}`, unmounts all `${RUNTIME_DIRECTORY}/app-rootfs/*` overlays, and unmounts `${RUNTIME_DIRECTORY}/stage1`.
 
 ---
 
 ## Declarative systemd unit example
 
-Persistent pods can be managed as standard systemd units without wrapper scripts. The following example (`/etc/systemd/system/pod-bgp.service`) runs two routing daemons (`zebra-riscv64` and `bgpd-riscv64`) in a shared pod with a shared `/vol/run` socket directory and a read-only `/vol/conf` configuration bind mount from the host:
+Persistent pods can be managed as standard systemd units without hardcoded UUIDs. The unit name (`pod-bgp.service`) becomes the `machinectl` machine name (`pod-bgp`), `INVOCATION_ID` becomes the container hostname on each activation (overridable via `SetCredential=pod.hostname:<name>`), and `/etc/machine-id` is derived deterministically from the host `/etc/machine-id` and machine name so `journalctl -M pod-bgp` spans restarts:
 
 ```ini
 [Unit]
@@ -271,9 +255,8 @@ RestartSec=5s
 PrivateNetwork=no
 PrivateIPC=yes
 
-RuntimeDirectory=pods/d7bc34da-2004-47cd-88c0-5d1e3d3eae60
+RuntimeDirectory=pods/%N
 
-SetCredential=pod.uuid:d7bc34da-2004-47cd-88c0-5d1e3d3eae60
 SetCredential=pod.stage1:stage1-debian
 SetCredential=pod.caps:CAP_NET_ADMIN,CAP_NET_RAW,CAP_NET_BIND_SERVICE,CAP_SYS_ADMIN
 SetCredential=vol.run:mode=0775,uid=104,gid=107
@@ -284,7 +267,6 @@ SetCredential=pod.app.bgpd:image=bgpd-riscv64,exec=/usr/lib/quagga/bgpd -A 127.0
 ExecStart=/usr/lib/systemd/pod-net-start
 ExecStartPost=/usr/lib/systemd/pod-wait-ready
 ExecStartPost=/usr/lib/systemd/pod-apps-start
-ExecStopPost=-/usr/lib/systemd/pod-net-stop
 
 [Install]
 WantedBy=multi-user.target
@@ -302,10 +284,11 @@ sudo machinectl list
 
 ### View container logs from the host
 
-Query a specific pod by machine name, or search merged host and pod journals without specifying the UUID:
+Query a specific pod by machine name (spanning restarts, with each activation stamped by its `INVOCATION_ID` hostname), filter across all machine IDs by `POD_UNIT=`, or search merged host and pod journals:
 
 ```sh
-sudo journalctl -M "pod-${POD_UUID}" -u ping.service
+sudo journalctl -M pod-bgp -u bgpd.service
+sudo journalctl -m POD_UNIT=pod-bgp
 sudo journalctl -m -u ping.service
 ```
 
@@ -314,7 +297,7 @@ sudo journalctl -m -u ping.service
 Because `SetCredential=` executes the pod supervisor inside a private mount namespace (`CLONE_NEWNS`), the per-pod stage 1 and per-instance stage 2 OverlayFS mounts do not appear in the host `mount` table. Inspect them inside the container namespace with `nsenter`:
 
 ```sh
-MACHINE_PID="$(machinectl show --property=Leader --value "pod-${POD_UUID}")"
+MACHINE_PID="$(machinectl show --property=Leader --value pod-bgp)"
 sudo nsenter --target "${MACHINE_PID}" --mount --root --pid mount
 ```
 
@@ -322,15 +305,15 @@ sudo nsenter --target "${MACHINE_PID}" --mount --root --pid mount
 
 * Enter the active application in a single-application pod automatically:
   ```sh
-  sudo machinectl shell "pod-${POD_UUID}"
+  sudo machinectl shell pod-strongswan
   ```
 * Target a specific application in a multi-application pod:
   ```sh
-  sudo machinectl shell --setenv=POD_APP=zebra "pod-${POD_UUID}"
+  sudo machinectl shell --setenv=POD_APP=zebra pod-bgp
   ```
 * Remain in the stage 1 Debian supervisor shell without entering stage 2:
   ```sh
-  sudo machinectl shell --setenv=POD_STAGE1_STAY=1 "pod-${POD_UUID}"
+  sudo machinectl shell --setenv=POD_STAGE1_STAY=1 pod-bgp
   ```
 
 ### Execute a one-off management command inside a stage 2 application
@@ -338,7 +321,7 @@ sudo nsenter --target "${MACHINE_PID}" --mount --root --pid mount
 Because each stage 2 unit runs with `MountAPIVFS=yes` and `RootDirectory=/opt/stage2/<app>/rootfs`, systemd mounts a private `/run` tmpfs inside that service unit. Daemons that expose Unix control sockets (such as FRR `vtysh` or strongSwan `swanctl` over VICI) should place their socket directory on a shared pod volume (`SetCredential=vol.run:...` bound into `/run/<subdir>`), and one-off host management commands should bind the same `/vol/*` paths:
 
 ```sh
-sudo systemd-run --machine="pod-${POD_UUID}" --pipe --wait \
+sudo systemd-run --machine=pod-bgp --collect --pipe --wait \
   --property=RootDirectory=/opt/stage2/bgpd/rootfs \
   --property=BindPaths=/vol/run:/run/quagga \
   --property=BindReadOnlyPaths=/vol/conf:/etc/quagga \
@@ -348,10 +331,10 @@ sudo systemd-run --machine="pod-${POD_UUID}" --pipe --wait \
 ### Stop a pod
 
 ```sh
-sudo machinectl stop "pod-${POD_UUID}"
+sudo machinectl stop pod-bgp
 ```
 
 ### Operational notes
 
 * Do not restart `systemd-machined.service` on the host while registered pods (`--register=yes`) are running, as restarting `systemd-machined` drops machine registrations and disrupts active host-networked `systemd-nspawn` instances.
-* On systemd 252 and newer, `systemctl --machine="pod-${POD_UUID}" cat <unit>` is rejected across container buses; use `systemctl --machine="pod-${POD_UUID}" is-active <unit>` or `show` properties for non-interactive readiness checks.
+* On systemd 252 and newer, `systemctl --machine=pod-bgp cat <unit>` is rejected across container buses; use `systemctl --machine=pod-bgp is-active <unit>` or `show` properties for non-interactive readiness checks.

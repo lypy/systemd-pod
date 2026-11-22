@@ -4,6 +4,7 @@ set -eu
 apps=""
 seen_imgs=","
 version_id=""
+stage1_hostname="$(uname -n)"
 
 cgroup_slice=""
 if [ -d /sys/fs/cgroup/system.slice ]; then
@@ -11,8 +12,6 @@ if [ -d /sys/fs/cgroup/system.slice ]; then
 elif [ -d /sys/fs/cgroup/systemd/system.slice ]; then
     cgroup_slice="/sys/fs/cgroup/systemd/system.slice"
 fi
-
-stage1_root="$(stat -Lc '%d:%i' / 2>/dev/null || true)"
 
 if [ -n "$cgroup_slice" ]; then
     for unit_dir in "${cgroup_slice}"/*.service; do
@@ -28,31 +27,19 @@ if [ -n "$cgroup_slice" ]; then
         if [ -r "${unit_dir}/cgroup.procs" ]; then
             IFS= read -r pid < "${unit_dir}/cgroup.procs" || true
         fi
-        if [ -z "$pid" ] || [ ! -e "/proc/${pid}/root" ]; then
-            continue
-        fi
-
-        proc_root="$(stat -Lc '%d:%i' "/proc/${pid}/root" 2>/dev/null || true)"
-        if [ -z "$proc_root" ] || [ "$proc_root" = "$stage1_root" ]; then
+        if [ -z "$pid" ] || [ ! -e "/proc/${pid}/root" ] || [ "/proc/${pid}/root" -ef / ]; then
             continue
         fi
 
         app_id=""
         cand="${unit_name%.service}"
-        if [ -d "/opt/stage2/${cand}/rootfs" ]; then
-            cand_root="$(stat -Lc '%d:%i' "/opt/stage2/${cand}/rootfs" 2>/dev/null || true)"
-            if [ "$cand_root" = "$proc_root" ]; then
-                app_id="$cand"
-            fi
+        if [ -d "/opt/stage2/${cand}/rootfs" ] && [ "/proc/${pid}/root" -ef "/opt/stage2/${cand}/rootfs" ]; then
+            app_id="$cand"
         fi
 
         if [ -z "$app_id" ]; then
             for stage2_dir in /opt/stage2/*/rootfs; do
-                if [ ! -d "$stage2_dir" ]; then
-                    continue
-                fi
-                cand_root="$(stat -Lc '%d:%i' "$stage2_dir" 2>/dev/null || true)"
-                if [ "$cand_root" = "$proc_root" ]; then
+                if [ -d "$stage2_dir" ] && [ "/proc/${pid}/root" -ef "$stage2_dir" ]; then
                     tmp="${stage2_dir#/opt/stage2/}"
                     app_id="${tmp%/rootfs}"
                     break
@@ -65,6 +52,17 @@ if [ -n "$cgroup_slice" ]; then
         fi
 
         root_dir="/opt/stage2/${app_id}/rootfs"
+        if [ -e "/proc/${pid}/ns/uts" ] && [ ! "/proc/${pid}/ns/uts" -ef /proc/1/ns/uts ]; then
+            cur_host="$(/usr/bin/nsenter --target="${pid}" --uts uname -n 2>/dev/null || true)"
+            if [ -z "$cur_host" ] || [ "$cur_host" = "$stage1_hostname" ]; then
+                app_inv="$(systemctl show -p InvocationID --value "${unit_name}" 2>/dev/null || true)"
+                if [ -n "$app_inv" ]; then
+                    /usr/bin/nsenter --target="${pid}" --uts /bin/hostname "${app_inv}" 2>/dev/null || true
+                    printf '%s\n' "${app_inv}" > "${root_dir}/etc/hostname"
+                fi
+            fi
+        fi
+
         if [ -f "/opt/stage2/${app_id}/image" ]; then
             img_name="$(tr -d ' \t\r\n' < "/opt/stage2/${app_id}/image")"
         else
