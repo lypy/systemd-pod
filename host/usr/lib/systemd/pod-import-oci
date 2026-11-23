@@ -1,0 +1,204 @@
+#!/bin/sh
+set -eu
+
+usage() {
+    cat <<'EOF' >&2
+Usage: pod-import-oci <oci-or-docker-ref> <stage2-image-name> [options]
+
+Options:
+  --arch=<arch>           Override target CPU architecture (for example amd64, 386, arm64)
+  --os=<os>               Override target OS (default: linux)
+  --variant=<variant>     Override architecture variant (for example v7)
+  --creds=<user:pass>     Registry credentials passed to skopeo --src-creds
+  --tls-verify=<bool>     Verify TLS certificates (true or false)
+
+Example:
+  pod-import-oci docker://docker.io/library/redis:7-alpine redis-alpine
+EOF
+    exit 1
+}
+
+if [ "$#" -lt 2 ]; then
+    usage
+fi
+
+SRC_REF="$1"
+IMG_NAME="$2"
+shift 2
+
+case "$IMG_NAME" in
+    ""|*/*|*..*|.*|-*)
+        echo "Invalid stage 2 image name: ${IMG_NAME}" >&2
+        exit 1
+        ;;
+esac
+if ! printf '%s' "$IMG_NAME" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$'; then
+    echo "Invalid stage 2 image name: ${IMG_NAME} (allowed: A-Z, a-z, 0-9, ., _, -; max 64 chars)" >&2
+    exit 1
+fi
+
+for cmd in skopeo umoci jq machinectl; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+        echo "Missing required tool: ${cmd}" >&2
+        exit 1
+    fi
+done
+
+n="$#"
+while [ "$n" -gt 0 ]; do
+    arg="$1"
+    shift
+    n=$((n - 1))
+    case "$arg" in
+        --arch=*)       set -- "$@" "--override-arch=${arg#*=}" ;;
+        --os=*)         set -- "$@" "--override-os=${arg#*=}" ;;
+        --variant=*)    set -- "$@" "--override-variant=${arg#*=}" ;;
+        --creds=*)      set -- "$@" "--src-creds=${arg#*=}" ;;
+        --tls-verify=*) set -- "$@" "--src-tls-verify=${arg#*=}" ;;
+        *)              echo "Unknown option: ${arg}" >&2; usage ;;
+    esac
+done
+
+TARGET_DIR="/var/lib/machines/${IMG_NAME}"
+mkdir -p /var/lib/machines
+TMP_DIR="$(mktemp -d "/var/lib/machines/.import-${IMG_NAME}.XXXXXX")"
+
+cleanup() {
+    rm -rf "${TMP_DIR}"
+}
+trap cleanup EXIT INT TERM
+
+# 1. Fetch the image into a temporary OCI layout and unpack its layers
+skopeo copy --quiet "$@" "${SRC_REF}" "oci:${TMP_DIR}/oci:import"
+umoci unpack --image "${TMP_DIR}/oci:import" "${TMP_DIR}/bundle"
+
+ROOTFS="${TMP_DIR}/bundle/rootfs"
+BUNDLE_CFG="${TMP_DIR}/bundle/config.json"
+
+# 2. Write /etc/pod-environment with safe systemd EnvironmentFile= quoting
+mkdir -p "${ROOTFS}/etc"
+jq -r '
+    .process.env[]? // empty
+    | capture("^(?<k>[^=]+)=(?<v>.*)$")
+    | "\(.k)=\"\(.v | gsub("\\\\"; "\\\\") | gsub("\""; "\\\"") | gsub("\n"; "\\n") | gsub("\r"; "\\r"))\""
+' "${BUNDLE_CFG}" > "${ROOTFS}/etc/pod-environment"
+
+# 3. Resolve argv[0] against the container PATH inside ROOTFS so systemd ExecStart= gets an absolute path
+IMG_PATH="$(jq -r '.process.env[]? | select(startswith("PATH=")) | sub("^PATH="; "")' "${BUNDLE_CFG}" | head -n 1)"
+if [ -z "$IMG_PATH" ]; then
+    IMG_PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+fi
+
+ARGV0="$(jq -r '.process.args[0] // empty' "${BUNDLE_CFG}")"
+if [ -z "$ARGV0" ]; then
+    echo "OCI image ${SRC_REF} does not define an Entrypoint or Cmd" >&2
+    exit 1
+fi
+
+RESOLVED_ARGV0=""
+case "$ARGV0" in
+    /*)
+        RESOLVED_ARGV0="$ARGV0"
+        ;;
+    *)
+        old_ifs="$IFS"
+        set -f
+        IFS=':'
+        for pdir in $IMG_PATH; do
+            [ -n "$pdir" ] || continue
+            cand="${ROOTFS}${pdir}/${ARGV0}"
+            if [ -L "$cand" ] || { [ -x "$cand" ] && [ ! -d "$cand" ]; }; then
+                RESOLVED_ARGV0="${pdir}/${ARGV0}"
+                break
+            fi
+        done
+        IFS="$old_ifs"
+        set +f
+        if [ -z "$RESOLVED_ARGV0" ]; then
+            echo "Warning: could not locate ${ARGV0} in container PATH (${IMG_PATH}); defaulting to /usr/bin/${ARGV0}" >&2
+            RESOLVED_ARGV0="/usr/bin/${ARGV0}"
+        fi
+        ;;
+esac
+
+# 4. Format ExecStart= with systemd specifier (%% and $$) and quote escaping
+EXEC_START="$(jq -r --arg bin "$RESOLVED_ARGV0" '
+    ([ $bin ] + (.process.args[1:] // []))
+    | map(
+        gsub("\\\\"; "\\\\")
+        | gsub("\""; "\\\"")
+        | gsub("%"; "%%")
+        | gsub("\\$"; "$$")
+        | "\"\(.)\""
+      )
+    | join(" ")
+' "${BUNDLE_CFG}")"
+
+CWD="$(jq -r '(.process.cwd // "/") | gsub("%"; "%%")' "${BUNDLE_CFG}")"
+UID_VAL="$(jq -r '.process.user.uid // 0' "${BUNDLE_CFG}")"
+GID_VAL="$(jq -r '.process.user.gid // 0' "${BUNDLE_CFG}")"
+SUP_GIDS="$(jq -r --argjson gid "${GID_VAL}" '
+    (.process.user.additionalGids // [])
+    | map(select(. != $gid))
+    | unique
+    | map(tostring)
+    | join(" ")
+' "${BUNDLE_CFG}")"
+
+STOP_SIG="$(skopeo inspect --config "oci:${TMP_DIR}/oci:import" | jq -r '.config.StopSignal // empty')"
+if [ -n "$STOP_SIG" ]; then
+    case "$STOP_SIG" in
+        *[!0-9]*)
+            STOP_SIG="$(printf '%s' "$STOP_SIG" | tr '[:lower:]' '[:upper:]')"
+            case "$STOP_SIG" in
+                SIG*) ;;
+                *)    STOP_SIG="SIG${STOP_SIG}" ;;
+            esac
+            ;;
+    esac
+fi
+
+# 5. Emit /etc/pod.service (loaded as 10-image.conf by pod-container-start)
+#    Use pod-stdio@%N.service FIFO bridge so OCI apps that open("/dev/stdout")
+#    or open("/dev/stderr") (such as nginx or httpd) do not hit ENXIO on a
+#    journald stream socket while still streaming all logs to journald.
+{
+    printf '[Unit]\n'
+    printf 'Wants=pod-stdio@%%N.service\n'
+    printf 'After=pod-stdio@%%N.service\n'
+    printf '\n'
+    printf '[Service]\n'
+    printf 'StandardOutput=file:/run/pod-stdio/%%N.fifo\n'
+    printf 'StandardError=file:/run/pod-stdio/%%N.fifo\n'
+    printf 'WorkingDirectory=%s\n' "${CWD}"
+    if [ "$UID_VAL" != "0" ]; then
+        printf 'User=%s\n' "${UID_VAL}"
+    fi
+    if [ "$GID_VAL" != "0" ]; then
+        printf 'Group=%s\n' "${GID_VAL}"
+    fi
+    if [ -n "$SUP_GIDS" ]; then
+        printf 'SupplementaryGroups=%s\n' "${SUP_GIDS}"
+    fi
+    if [ -n "$STOP_SIG" ]; then
+        printf 'KillSignal=%s\n' "${STOP_SIG}"
+    fi
+    printf 'ExecStart=%s\n' "${EXEC_START}"
+} > "${ROOTFS}/etc/pod.service"
+
+# 6. Atomically install into /var/lib/machines/<image> and mark read-only
+chmod 0755 "${ROOTFS}"
+if [ -e "${TARGET_DIR}" ]; then
+    machinectl read-only "${IMG_NAME}" no 2>/dev/null || true
+    mv "${TARGET_DIR}" "${TMP_DIR}/old"
+fi
+
+if ! mv "${ROOTFS}" "${TARGET_DIR}"; then
+    if [ -e "${TMP_DIR}/old" ]; then
+        mv "${TMP_DIR}/old" "${TARGET_DIR}" 2>/dev/null || true
+    fi
+    exit 1
+fi
+
+machinectl read-only "${IMG_NAME}" yes
+echo "Imported ${SRC_REF} -> ${TARGET_DIR}"

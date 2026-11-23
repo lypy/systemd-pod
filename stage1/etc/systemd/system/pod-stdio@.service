@@ -1,0 +1,14 @@
+[Unit]
+Description=FIFO stdio bridge to journald for Stage 2 %i
+DefaultDependencies=no
+After=systemd-journald.socket
+Before=%i.service shutdown.target
+Conflicts=shutdown.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=exec
+SyslogIdentifier=%i
+ExecStartPre=/bin/sh -c 'mkdir -p -m 0755 /run/pod-stdio && rm -f /run/pod-stdio/%i.fifo && mkfifo -m 0666 /run/pod-stdio/%i.fifo'
+ExecStart=/bin/sh -c 'exec /bin/cat <> /run/pod-stdio/%i.fifo'
+Restart=always
