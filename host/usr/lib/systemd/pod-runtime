@@ -571,6 +571,27 @@ cmd_start() {
         printf 'LogExtraFields=POD_UNIT=%s\n' "${MACHINE_NAME}"
     } > "${UNIT_DIR}/pod-stdio@.service.d/10-pod-unit.conf"
 
+    mkdir -p "${UNIT_DIR}/run-.service.d"
+    cat <<'EOF' > "${UNIT_DIR}/run-.service.d/10-no-deps.conf"
+[Unit]
+DefaultDependencies=no
+Before=shutdown.target
+Conflicts=shutdown.target
+EOF
+
+    for masked_unit in \
+        systemd-journal-flush.service \
+        systemd-sysusers.service \
+        systemd-tmpfiles-setup.service \
+        systemd-tmpfiles-setup-dev.service \
+        systemd-sysctl.service \
+        systemd-random-seed.service \
+        systemd-machine-id-commit.service \
+        systemd-update-utmp.service
+    do
+        ln -sfn /dev/null "${UNIT_DIR}/${masked_unit}"
+    done
+
     ensure_stage1_shell_alias "stage1"
 
     for cred in "${CRED_DIR}"/pod.app.*; do
@@ -750,19 +771,39 @@ EOF
         NSPAWN_APP_BINDS="${NSPAWN_APP_BINDS} --bind=${app_merged}:${app_target}"
     done
 
-    # 7. Wire journal directory bindings for journalctl -M and journalctl -m
-    NSPAWN_JOURNAL_BINDS=""
+    # 7. Configure bounded volatile journald storage and wire /run/log/journal
+    mkdir -p "${STAGE1_ROOT}/etc/systemd/journald.conf.d"
+    journal_max_use="64M"
+    journal_max_file="8M"
+    if [ -f "${CRED_DIR}/pod.journal" ]; then
+        j_spec="$(tr -d ' \t\r\n' < "${CRED_DIR}/pod.journal")"
+        val_use="$(read_kv RuntimeMaxUse "$j_spec" || true)"
+        if [ -n "$val_use" ]; then
+            journal_max_use="$val_use"
+        fi
+        val_file="$(read_kv RuntimeMaxFileSize "$j_spec" || true)"
+        if [ -n "$val_file" ]; then
+            journal_max_file="$val_file"
+        fi
+    fi
+    {
+        printf '[Journal]\n'
+        printf 'Storage=volatile\n'
+        printf 'RuntimeMaxUse=%s\n' "${journal_max_use}"
+        printf 'RuntimeMaxFileSize=%s\n' "${journal_max_file}"
+    } > "${STAGE1_ROOT}/etc/systemd/journald.conf.d/10-pod.conf"
 
     nsenter --mount=/proc/1/ns/mnt -- mkdir -p "/run/log/journal/${HOST_MACHINE_ID}.${MACHINE_NAME}"
     nsenter --mount=/proc/1/ns/mnt -- ln -sfn "${HOST_MACHINE_ID}.${MACHINE_NAME}" "/run/log/journal/${POD_MACHINE_ID}"
     mkdir -p "${STAGE1_ROOT}/run/log/journal/${POD_MACHINE_ID}"
     NSPAWN_JOURNAL_BINDS="--bind=/run/log/journal/${HOST_MACHINE_ID}.${MACHINE_NAME}:/run/log/journal/${POD_MACHINE_ID}"
 
+    # Remove any stale persistent journal directory or symlink left for this pod
     if [ -d /var/log/journal ]; then
-        nsenter --mount=/proc/1/ns/mnt -- mkdir -p "/var/log/journal/${HOST_MACHINE_ID}.${MACHINE_NAME}"
-        nsenter --mount=/proc/1/ns/mnt -- ln -sfn "${HOST_MACHINE_ID}.${MACHINE_NAME}" "/var/log/journal/${POD_MACHINE_ID}"
-        mkdir -p "${STAGE1_ROOT}/var/log/journal/${POD_MACHINE_ID}"
-        NSPAWN_JOURNAL_BINDS="${NSPAWN_JOURNAL_BINDS} --bind=/var/log/journal/${HOST_MACHINE_ID}.${MACHINE_NAME}:/var/log/journal/${POD_MACHINE_ID}"
+        nsenter --mount=/proc/1/ns/mnt -- rm -rf "/var/log/journal/${HOST_MACHINE_ID}.${MACHINE_NAME}"
+        if [ -L "/var/log/journal/${POD_MACHINE_ID}" ]; then
+            nsenter --mount=/proc/1/ns/mnt -- rm -f "/var/log/journal/${POD_MACHINE_ID}"
+        fi
     fi
 
     # 8. Resolve Stage 1 capabilities and disable image lock / seccomp filtering
