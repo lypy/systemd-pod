@@ -6,13 +6,14 @@ A shared immutable Stage 1 image (`/var/lib/machines/stage1-debian` -> `.store/s
 
 Manifest metadata (`user.pod.unit`, `user.pod.env`, `user.pod.version`, and `user.xdg.origin.url`) is stored as extended attributes on immutable versioned image directories under `/var/lib/machines/.store/<image>_<version>`, keeping Stage 2 root filesystems unmodified (including `scratch` images with no `/etc` directory). `SetCredential=` (introduced in systemd 247) passes declarative parameters from the unit file to the host runtime:
 
-1. `host/usr/lib/systemd/pod-runtime` (`start`, `stop`, and `inspect <image>`) unifies host-networked and private-namespace networking (`PrivateNetwork=yes` with `net.if.*` VLAN/veth/macvlan/ipvlan interfaces and 802.1Q teardown retry), resolves versioned Stage 1 and Stage 2 symlinks via `readlink -f`, materialises `user.pod.unit` and `user.pod.env` extended attributes into Stage 1 unit drop-ins (`10-image.conf`) and `/etc/systemd/system/<app>.env`, isolates Stage 2 rootless identities via numeric `pod-uid-<uid>`/`pod-gid-<gid>` entries, registers UID 0 `<app>@<pod>` and `stage1@<pod>` shell aliases, unregisters stale `systemd-machined` entries via `UnregisterMachine`, and executes `systemd-nspawn --notify-ready=yes`.
-2. `host/usr/lib/systemd/pod-image-seal` seals OCI and non-OCI rootfs trees into immutable `/var/lib/machines/.store/<image>_<version>` directories (`chattr +i`), writes `user.pod.unit`, `user.pod.env`, `user.pod.version`, and `user.xdg.origin.url` extended attributes (using `0s` base64 encoding and an `ext4` 4 KiB budget check), refuses to overwrite active OverlayFS lowerdirs, and atomically flips `/var/lib/machines/<image>`.
-3. `host/usr/lib/systemd/pod-import-oci` imports unmodified Docker and OCI images using `skopeo`, `umoci`, and `jq`, generates unit and environment metadata outside the rootfs, derives a content-digest version tag, and seals them via `pod-image-seal`.
-4. `host/usr/lib/systemd/pod-image-gc` (`--status`, `--dry-run`, `--inspect <image>`) reports active, pinned, and unused `.store/` image versions, inspects sealed image extended attributes, and safely reclaims unreferenced versions.
-5. `stage1/usr/bin/pod-exec` runs inside Stage 1 so one-off host commands (`systemd-run -M <pod> -q --collect --pipe --wait pod-exec <app> <cmd> ...`) join a running Stage 2 service's live namespaces directly via `nsenter` without repeating `RootDirectory=` or `BindPaths=`.
-6. `stage1/etc/systemd/system/pod-stage2-post@.service` and `stage1/usr/lib/systemd/pod-stage2-post` run inside Stage 1 after each Stage 2 service starts or restarts, stamping each Stage 2 private UTS namespace and `/etc/hostname` with its own `InvocationID` and synchronising `/etc/os-release` under `flock` before `pod-idle.target` signals readiness to the host.
-7. `stage1/etc/systemd/system/pod-stdio@.service` provides a per-application FIFO bridge to `systemd-journald` so OCI applications that call `open("/dev/stdout")` or `open("/dev/stderr")` (such as `nginx` or `httpd`) do not encounter `ENXIO` on a `journald` stream socket while still streaming all output to the pod journal with `POD_UNIT=` metadata.
+1. `host/usr/lib/systemd/pod-runtime` (`start`, `stop`, `inspect <image>`, and `execute [options] <image> ...`) unifies host-networked and private-namespace networking (`PrivateNetwork=yes` with `net.if.*` VLAN/veth/macvlan/ipvlan interfaces and 802.1Q teardown retry), resolves versioned Stage 1 and Stage 2 symlinks via `readlink -f` (with automatic default Stage 1 resolution when `pod.stage1` is omitted), materialises `user.pod.unit` and `user.pod.env` extended attributes into Stage 1 unit drop-ins (`10-image.conf`) and `/etc/systemd/system/<app>.env`, supports both comma-delimited and newline-delimited `pod.app.*` credentials, isolates Stage 2 rootless identities via numeric `pod-uid-<uid>`/`pod-gid-<gid>` entries, registers UID 0 `<app>@<pod>` and `stage1@<pod>` shell aliases, locks Stage 1 `systemd-journald` to bounded volatile storage under `/run/log/journal` (tunable via `pod.journal`), shields Stage 1 from `sysinit.target` activation via `run-.service.d/10-no-deps.conf` and masked host-boot units, unregisters stale `systemd-machined` entries via `UnregisterMachine`, executes `systemd-nspawn --notify-ready=yes`, and compiles `rkt`-style CLI flags into `systemd-run` arguments via `execute`.
+2. `host/etc/systemd/system/pod-.service.d/10-defaults.conf` applies shared supervisor properties (`Type=notify`, `Slice=machine.slice`, `Delegate=yes`, `KillMode=mixed`, `PrivateIPC=yes`, `RuntimeDirectory=pods/%N`, and `ExecStopPost=-/usr/lib/systemd/pod-runtime stop`) automatically to every host `pod-*.service` unit, covering both persistent units and transient `systemd-run -u pod-<name>` launches.
+3. `host/usr/lib/systemd/pod-image-seal` seals OCI and non-OCI rootfs trees into immutable `/var/lib/machines/.store/<image>_<version>` directories (`chattr +i`), writes `user.pod.unit`, `user.pod.env`, `user.pod.version`, and `user.xdg.origin.url` extended attributes (using `0s` base64 encoding and an `ext4` 4 KiB budget check), refuses to overwrite active OverlayFS lowerdirs, and atomically flips `/var/lib/machines/<image>`.
+4. `host/usr/lib/systemd/pod-import-oci` imports unmodified Docker and OCI images using `skopeo`, `umoci`, and `jq`, generates unit and environment metadata outside the rootfs, derives a content-digest version tag, and seals them via `pod-image-seal`.
+5. `host/usr/lib/systemd/pod-image-gc` (`--status`, `--dry-run`, `--inspect <image>`) reports active, pinned, and unused `.store/` image versions, inspects sealed image extended attributes, and safely reclaims unreferenced versions.
+6. `stage1/usr/bin/pod-exec` runs inside Stage 1 so one-off host commands (`systemd-run -M <pod> -q --collect --pipe --wait pod-exec <app> <cmd> ...`) join a running Stage 2 service's live namespaces directly via `nsenter` without repeating `RootDirectory=` or `BindPaths=`.
+7. `stage1/etc/systemd/system/pod-stage2-post@.service` and `stage1/usr/lib/systemd/pod-stage2-post` run inside Stage 1 after each Stage 2 service starts or restarts, stamping each Stage 2 private UTS namespace and `/etc/hostname` with its own `InvocationID` and synchronising `/etc/os-release` under `flock` before `pod-idle.target` signals readiness to the host.
+8. `stage1/etc/systemd/system/pod-stdio@.service` provides a per-application FIFO bridge to `systemd-journald` so OCI applications that call `open("/dev/stdout")` or `open("/dev/stderr")` (such as `nginx` or `httpd`) do not encounter `ENXIO` on a `journald` stream socket while still streaming all output to the pod journal with `POD_UNIT=` metadata.
 
 ---
 
@@ -22,6 +23,11 @@ Manifest metadata (`user.pod.unit`, `user.pod.env`, `user.pod.version`, and `use
 .
 ├── README.md
 ├── host
+│   ├── etc
+│   │   └── systemd
+│   │       └── system
+│   │           └── pod-.service.d
+│   │               └── 10-defaults.conf
 │   └── usr
 │       └── lib
 │           └── systemd
@@ -34,6 +40,8 @@ Manifest metadata (`user.pod.unit`, `user.pod.env`, `user.pod.version`, and `use
     │   ├── profile.d
     │   │   └── pod-enter.sh
     │   └── systemd
+    │       ├── journald.conf.d
+    │       │   └── 10-pod.conf
     │       └── system
     │           ├── container-shell@.service.d
     │           │   └── 10-no-deps.conf
@@ -46,6 +54,8 @@ Manifest metadata (`user.pod.unit`, `user.pod.env`, `user.pod.version`, and `use
     │           ├── pod-os-release-sync.service
     │           ├── pod-stage2-post@.service
     │           ├── pod-stdio@.service
+    │           ├── run-.service.d
+    │           │   └── 10-no-deps.conf
     │           ├── systemd-journald-dev-log.socket.d
     │           │   └── 10-no-deps.conf
     │           ├── systemd-journald.service.d
@@ -72,12 +82,13 @@ sudo apt-get update
 sudo apt-get install -y --no-install-recommends attr skopeo umoci jq
 ```
 
-Install the four host scripts from [`host/usr/lib/systemd/`](host/usr/lib/systemd/) into `/usr/lib/systemd/`:
+Install the four host scripts from [`host/usr/lib/systemd/`](host/usr/lib/systemd/) into `/usr/lib/systemd/` and the host prefix drop-in [`host/etc/systemd/system/pod-.service.d/10-defaults.conf`](host/etc/systemd/system/pod-.service.d/10-defaults.conf) into `/etc/systemd/system/pod-.service.d/`:
 
 * [`host/usr/lib/systemd/pod-runtime`](host/usr/lib/systemd/pod-runtime)
 * [`host/usr/lib/systemd/pod-image-seal`](host/usr/lib/systemd/pod-image-seal)
 * [`host/usr/lib/systemd/pod-import-oci`](host/usr/lib/systemd/pod-import-oci)
 * [`host/usr/lib/systemd/pod-image-gc`](host/usr/lib/systemd/pod-image-gc)
+* [`host/etc/systemd/system/pod-.service.d/10-defaults.conf`](host/etc/systemd/system/pod-.service.d/10-defaults.conf)
 
 ```sh
 sudo install -m 0755 \
@@ -86,7 +97,15 @@ sudo install -m 0755 \
   host/usr/lib/systemd/pod-import-oci \
   host/usr/lib/systemd/pod-image-gc \
   /usr/lib/systemd/
+
+sudo install -d -m 0755 /etc/systemd/system/pod-.service.d
+sudo install -m 0644 \
+  host/etc/systemd/system/pod-.service.d/10-defaults.conf \
+  /etc/systemd/system/pod-.service.d/10-defaults.conf
+sudo systemctl daemon-reload
 ```
+
+Reserve the `pod-*.service` unit prefix on the host exclusively for container pods managed by `pod-runtime` so host timers or helper jobs do not inherit `10-defaults.conf`.
 
 ---
 
@@ -112,12 +131,14 @@ sudo debootstrap \
 
 Copy the files from [`stage1/`](stage1/) into `"${STAGE_ROOT}"`:
 
+* [`stage1/etc/systemd/journald.conf.d/10-pod.conf`](stage1/etc/systemd/journald.conf.d/10-pod.conf)
 * [`stage1/etc/systemd/system/pod-idle.target`](stage1/etc/systemd/system/pod-idle.target)
 * [`stage1/etc/systemd/system/pod-os-release-sync.path`](stage1/etc/systemd/system/pod-os-release-sync.path)
 * [`stage1/etc/systemd/system/pod-os-release-sync.service`](stage1/etc/systemd/system/pod-os-release-sync.service)
 * [`stage1/etc/systemd/system/pod-stage2-post@.service`](stage1/etc/systemd/system/pod-stage2-post@.service)
 * [`stage1/etc/systemd/system/pod-stdio@.service`](stage1/etc/systemd/system/pod-stdio@.service)
 * [`stage1/etc/systemd/system/container-shell@.service.d/10-no-deps.conf`](stage1/etc/systemd/system/container-shell@.service.d/10-no-deps.conf)
+* [`stage1/etc/systemd/system/run-.service.d/10-no-deps.conf`](stage1/etc/systemd/system/run-.service.d/10-no-deps.conf)
 * [`stage1/etc/systemd/system/dbus.socket.d/10-no-deps.conf`](stage1/etc/systemd/system/dbus.socket.d/10-no-deps.conf)
 * [`stage1/etc/systemd/system/dbus.service.d/10-no-deps.conf`](stage1/etc/systemd/system/dbus.service.d/10-no-deps.conf)
 * [`stage1/etc/systemd/system/systemd-journald.socket.d/10-no-deps.conf`](stage1/etc/systemd/system/systemd-journald.socket.d/10-no-deps.conf)
@@ -145,6 +166,19 @@ Hook `/etc/bash.bashrc` to source `/etc/profile.d/pod-enter.sh` (`pod-enter.sh` 
 ```sh
 sudo ln -sf /etc/systemd/system/pod-idle.target \
   "${STAGE_ROOT}/etc/systemd/system/default.target"
+
+for masked_unit in \
+  systemd-journal-flush.service \
+  systemd-sysusers.service \
+  systemd-tmpfiles-setup.service \
+  systemd-tmpfiles-setup-dev.service \
+  systemd-sysctl.service \
+  systemd-random-seed.service \
+  systemd-machine-id-commit.service \
+  systemd-update-utmp.service
+do
+  sudo ln -sfn /dev/null "${STAGE_ROOT}/etc/systemd/system/${masked_unit}"
+done
 
 if ! sudo grep -q "pod-enter.sh" "${STAGE_ROOT}/etc/bash.bashrc"; then
     sudo tee -a "${STAGE_ROOT}/etc/bash.bashrc" << 'EOF'
@@ -235,30 +269,16 @@ sudo /usr/lib/systemd/pod-import-oci \
 
 Optional flags supported by `pod-import-oci`: `--arch=<arch>`, `--os=<os>`, `--variant=<variant>`, `--creds=<user:pass>`, and `--tls-verify=<bool>`.
 
-Run both imported images side by side in a shared pod (include `CAP_SETUID,CAP_SETGID,CAP_CHOWN,CAP_DAC_OVERRIDE` in `pod.caps` when root-started entrypoints such as `redis` or `nginx` drop privileges with `su-exec` or `gosu`; non-root OCI images such as `nginxinc/nginx-unprivileged` work with a bare `SetCredential=pod.app.nginx:nginx-unpriv-alpine` and no custom `pod.caps`):
+Run both imported images side by side in a shared pod using `/etc/systemd/system/pod-.service.d/10-defaults.conf` and `pod-runtime execute` (include `CAP_SETUID,CAP_SETGID,CAP_CHOWN,CAP_DAC_OVERRIDE` in `--caps` when root-started entrypoints such as `redis` or `nginx` drop privileges with `su-exec` or `gosu`; non-root OCI images such as `nginxinc/nginx-unprivileged` work with no custom `--caps`):
 
 ```sh
-sudo systemd-run --collect \
-  --unit=pod-webstack.service \
-  --slice=machine.slice \
-  --property=Type=notify \
-  --property=Delegate=yes \
-  --property=PrivateNetwork=yes \
-  --property=PrivateIPC=yes \
-  --property="RuntimeDirectory=pods/%N" \
-  --property="SetCredential=pod.stage1:stage1-debian" \
-  --property="SetCredential=pod.caps:CAP_NET_ADMIN,CAP_NET_RAW,CAP_NET_BIND_SERVICE,CAP_SYS_ADMIN,CAP_SETUID,CAP_SETGID,CAP_CHOWN,CAP_DAC_OVERRIDE" \
-  --property="SetCredential=vol.run:mode=0775,uid=0,gid=0" \
-  --property="SetCredential=pod.app.redis:image=redis-alpine,BindPaths=/vol/run:/run/redis,MemoryMax=128M" \
-  --property="SetCredential=pod.app.nginx:image=nginx-alpine,After=redis.service,BindPaths=/vol/run:/run/redis,MemoryMax=128M" \
-  --property="ExecStopPost=-/usr/lib/systemd/pod-runtime stop" \
-  /usr/lib/systemd/pod-runtime start
-```
-
-To override the command of an imported OCI image for one pod while preserving its `WorkingDirectory=`, `User=`, `KillSignal=`, and `user.pod.env` defaults, pass `ExecStart=` in the credential:
-
-```sh
---property="SetCredential=pod.app.redis:image=redis-alpine,ExecStart=/usr/local/bin/docker-entrypoint.sh redis-server --port 6380"
+sudo systemd-run -u pod-webstack $(/usr/lib/systemd/pod-runtime execute \
+  -n \
+  --caps=CAP_NET_ADMIN,CAP_NET_RAW,CAP_NET_BIND_SERVICE,CAP_SYS_ADMIN,CAP_SETUID,CAP_SETGID,CAP_CHOWN,CAP_DAC_OVERRIDE \
+  --volume=run,kind=empty,mode=0775 \
+  redis=redis-alpine --mount=volume=run,target=/run/redis --memory=128M \
+    -- /usr/local/bin/docker-entrypoint.sh redis-server --port 6380 --- \
+  nginx=nginx-alpine --after=redis --mount=volume=run,target=/run/redis --memory=128M)
 ```
 
 ### Inspecting and garbage-collecting sealed images
@@ -281,51 +301,67 @@ sudo /usr/lib/systemd/pod-image-gc
 
 ---
 
-## Running a pod with host networking
+## Running transient pods with `pod-runtime execute`
 
-When a pod runs with `PrivateNetwork=no`, `pod-runtime start` detects that `/proc/self/ns/net` matches `/proc/1/ns/net` (failing fast if any `net.if.*` credential is present), resolves the versioned Stage 1 and Stage 2 symlinks, materialises `user.pod.unit` and `user.pod.env` into the ephemeral Stage 1 overlay, unregisters any stale `systemd-machined` record, and executes `systemd-nspawn --notify-ready=yes`:
+With `/etc/systemd/system/pod-.service.d/10-defaults.conf` installed on the host, `pod-runtime execute` compiles `rkt`-style CLI flags into `--collect`, `-p PrivateNetwork=yes` (when private networking is requested), `cunescape`-encoded `-p SetCredential=...` arguments (switching any comma-containing `pod.app.*` credential automatically to newline-delimited form and doubling `%` to `%%` inside `--` and `--env=` values), and the trailing `/usr/lib/systemd/pod-runtime start` command. Output is buffered until validation succeeds, so syntax errors emit nothing to stdout.
+
+When `--stage1=` is omitted, `pod-runtime start` resolves the default Stage 1 image automatically in order: `stage1-default`, `stage1-debian`, the highest version-sorted `stage1-<arch>-*`, or the highest version-sorted `stage1-*` under `/var/lib/machines/`.
+
+| Parameter in `pod-runtime execute` | Scope | Generated `systemd-run` output |
+| --- | --- | --- |
+| `--net=host` | Pod | Leaves `PrivateNetwork=no` (default) |
+| `--net=private` (or `-n`) | Pod | Emits `-p PrivateNetwork=yes` |
+| `--net=<id>:<k=v,...>` | Pod | Emits `-p PrivateNetwork=yes` and `-p SetCredential=net.if.<id>:<k=v,...>` |
+| `--dns=<ip1,ip2>` | Pod | Emits `-p SetCredential=net.dns:<ip1,ip2>` |
+| `--hostname=<name>` | Pod | Emits `-p SetCredential=pod.hostname:<name>` |
+| `--stage1=<image>` | Pod | Emits `-p SetCredential=pod.stage1:<image>` |
+| `--caps=<cap1,cap2>` | Pod | Emits `-p SetCredential=pod.caps:<cap1,cap2>` |
+| `--journal=<k=v,...>` | Pod | Emits `-p SetCredential=pod.journal:<k=v,...>` |
+| `--volume=<name>,kind=empty[,mode=0775,uid=0,gid=0]` | Pod | Emits `-p SetCredential=vol.<name>:mode=...,uid=...,gid=...` |
+| `--volume=<name>,kind=host,source=<path>[,target=/vol/<name>,ro=true]` | Pod | Emits `-p SetCredential=host.bind.<name>:src=<path>,dst=...,ro=...` |
+| `<image>` or `<app>=<image>` | App | Starts a Stage 2 application block |
+| `--name=<app>` | App | Sets or overrides the Stage 2 application name for the current block |
+| `--exec=<cmd>` or `-- <cmd> <args...>` | App | Appends `ExecStart=` (with systemd argument quoting and `%` escaping for `--`) |
+| `--mount=volume=<name>,target=<dst>[,ro=true]` | App | Appends `<vol-target>:<dst>` to `BindPaths=` or `BindReadOnlyPaths=` |
+| `--bind=<src>:<dst>` / `--bind-ro=<src>:<dst>` | App | Appends `<src>:<dst>` to `BindPaths=` or `BindReadOnlyPaths=` |
+| `--after=<app>` / `--before=<app>` / `--requires=<app>` | App | Appends `After=`, `Before=`, or `Requires=` (`<app>.service`) |
+| `--memory=<limit>` / `--cpu=<quota>` / `--tasks=<max>` | App | Appends `MemoryMax=`, `CPUQuota=`, or `TasksMax=` |
+| `--user=<u_spec>` / `--group=<g_spec>` | App | Appends `User=` or `Group=` |
+| `--app-caps=<cap1,cap2>` | App | Appends `CapabilityBoundingSet=<cap1> <cap2>` |
+| `--env=<KEY=VAL>` | App | Appends `Environment="<KEY=VAL>"` (escaping `\`, `"`, and `%`) |
+| `--working-dir=<path>` | App | Appends `WorkingDirectory=<path>` |
+| `--directive=<Key=Value>` | App | Appends any native `systemd.unit(5)` or `systemd.service(5)` directive |
+| `---` | Delimiter | Closes the current application block and starts the next block |
+
+### Host networking
+
+When a pod runs with `PrivateNetwork=no` (default), `pod-runtime start` verifies `/proc/self/ns/net` matches `/proc/1/ns/net` (failing fast if any `net.if.*` credential is present):
 
 ```sh
-sudo systemd-run --collect \
-  --slice=machine.slice \
-  --property=Type=notify \
-  --property=Delegate=yes \
-  --property=PrivateNetwork=no \
-  --property=PrivateIPC=yes \
-  --property="RuntimeDirectory=pods/%N" \
-  --property="SetCredential=pod.stage1:stage1-debian" \
-  --property="SetCredential=pod.app.ping:test-ping" \
-  --property="ExecStopPost=-/usr/lib/systemd/pod-runtime stop" \
-  /usr/lib/systemd/pod-runtime start
+# Using sealed manifest defaults
+sudo systemd-run -u pod-ping $(/usr/lib/systemd/pod-runtime execute test-ping)
+
+# With a multi-argument command override
+sudo systemd-run -u pod-ping $(/usr/lib/systemd/pod-runtime execute \
+  test-ping -- /bin/ping -c 4 127.0.0.1)
 ```
 
----
+### Private networking with a VLAN-assigned NIC
 
-## Running a pod with private networking and a VLAN-assigned NIC
-
-When a pod runs with `PrivateNetwork=yes`, `systemd` allocates a new network namespace before executing `pod-runtime start`. `pod-runtime start` brings up `lo` inside the pod network namespace and creates each `SetCredential=net.if.<name>:ifname=<ifname>,master=<master>,kind=vlan,vlan_id=<id>[,addr=<cidr>][,gw=<ip>]` interface (or `kind=veth,peer=<host_veth>[,master=<bridge>]`, `kind=macvlan`, `kind=ipvlan`) from the host network namespace (`nsenter --net=/proc/1/ns/net`), retrying transiently if the kernel is still finishing an 802.1Q teardown from a rapid restart:
+When a pod runs with `PrivateNetwork=yes` (`-n` or `--net=<id>:...`), `systemd` allocates a new network namespace before executing `pod-runtime start`. `pod-runtime start` brings up `lo`, enables unprivileged ICMP sockets via `net.ipv4.ping_group_range`, and creates each `net.if.<name>` interface (`kind=vlan`, `veth`, `macvlan`, or `ipvlan`) from the host network namespace (`nsenter --net=/proc/1/ns/net`), retrying transiently if the kernel is still finishing an 802.1Q teardown from a rapid restart:
 
 ```sh
-sudo systemd-run --collect \
-  --slice=machine.slice \
-  --property=Type=notify \
-  --property=Delegate=yes \
-  --property=PrivateNetwork=yes \
-  --property=PrivateIPC=yes \
-  --property="RuntimeDirectory=pods/%N" \
-  --property="SetCredential=pod.stage1:stage1-debian" \
-  --property="SetCredential=net.dns:1.1.1.1,8.8.8.8" \
-  --property="SetCredential=net.if.vlan100:ifname=eth0,master=enp1s0,kind=vlan,vlan_id=100,addr=192.0.2.10/24,gw=192.0.2.1" \
-  --property="SetCredential=pod.app.ping:image=test-ping,ExecStart=/bin/ping 192.0.2.1" \
-  --property="ExecStopPost=-/usr/lib/systemd/pod-runtime stop" \
-  /usr/lib/systemd/pod-runtime start
+sudo systemd-run -u pod-vlan-ping $(/usr/lib/systemd/pod-runtime execute \
+  --dns=1.1.1.1,8.8.8.8 \
+  --net=vlan100:ifname=eth0,master=enp1s0,kind=vlan,vlan_id=100,addr=192.0.2.10/24,gw=192.0.2.1 \
+  ping=test-ping -- /bin/ping 192.0.2.1)
 ```
 
 ---
 
 ## Declarative systemd unit example
 
-Persistent pods are standard systemd units with no hardcoded UUIDs or `ExecStartPost=` orchestration hooks. The unit name (`pod-bgp.service`) becomes the `machinectl` machine name (`pod-bgp`), `INVOCATION_ID` becomes the Stage 1 hostname on each activation (overridable via `SetCredential=pod.hostname:<name>`), each Stage 2 service receives its own `InvocationID` UTS hostname, and `/etc/machine-id` is derived deterministically from the host `/etc/machine-id` and machine name so `journalctl -M pod-bgp` spans restarts. When images carry `ExecStart=` and capability defaults in `user.pod.unit`, pod credentials stay concise:
+Persistent pods are standard systemd units with no hardcoded UUIDs or `ExecStartPost=` orchestration hooks. `/etc/systemd/system/pod-.service.d/10-defaults.conf` supplies `Type=notify`, `Slice=machine.slice`, `Delegate=yes`, `KillMode=mixed`, `PrivateIPC=yes`, `RuntimeDirectory=pods/%N`, and `ExecStopPost=-/usr/lib/systemd/pod-runtime stop` automatically for every `pod-*.service` unit, leaving only workload-specific directives in the unit file itself:
 
 ```ini
 [Unit]
@@ -333,17 +369,9 @@ Description=BGP routing pod (zebra and bgpd)
 After=network.target
 
 [Service]
-Type=notify
-Slice=machine.slice
-Delegate=yes
-KillMode=mixed
 Restart=always
 RestartSec=5s
-
 PrivateNetwork=no
-PrivateIPC=yes
-
-RuntimeDirectory=pods/%N
 
 SetCredential=pod.stage1:stage1-debian
 SetCredential=pod.caps:CAP_NET_ADMIN,CAP_NET_RAW,CAP_NET_BIND_SERVICE,CAP_SYS_ADMIN
@@ -353,7 +381,6 @@ SetCredential=pod.app.zebra:image=frr-zebra,BindPaths=/vol/run:/run/frr,BindRead
 SetCredential=pod.app.bgpd:image=frr-bgpd,After=zebra.service,BindPaths=/vol/run:/run/frr,BindReadOnlyPaths=/vol/conf:/etc/frr,MemoryMax=256M,TasksMax=64
 
 ExecStart=/usr/lib/systemd/pod-runtime start
-ExecStopPost=-/usr/lib/systemd/pod-runtime stop
 
 [Install]
 WantedBy=multi-user.target
@@ -427,6 +454,8 @@ sudo systemctl stop pod-bgp.service
 
 ### Operational notes
 
+* Reserve the `pod-*.service` unit prefix on the host exclusively for container pods managed by `pod-runtime` so non-pod services or timers do not inherit `/etc/systemd/system/pod-.service.d/10-defaults.conf`.
+* Stage 1 `systemd-journald` is locked to bounded volatile storage under `/run/log/journal` (`Storage=volatile`, `RuntimeMaxUse=64M`, `RuntimeMaxFileSize=8M` by default, tunable via `SetCredential=pod.journal:RuntimeMaxUse=...,RuntimeMaxFileSize=...`), and `run-.service.d/10-no-deps.conf` plus masked `sysinit.target` services prevent `systemd-run -M <pod>` from flushing journals to `/var/log/journal` or recreating pruned `/etc/passwd` accounts.
 * Do not restart `systemd-machined.service` on the host while registered pods (`--register=yes`) are running, as restarting `systemd-machined` drops machine registrations and disrupts active host-networked `systemd-nspawn` instances.
 * On systemd 252 and newer, `systemctl --machine=pod-bgp cat <unit>` is rejected across container buses; use `systemctl --machine=pod-bgp is-active <unit>` or `show` properties for non-interactive readiness checks.
 * When invoking `systemd-run --property=RootDirectory=...` directly from the host against `/var/lib/machines/<image>`, canonicalise the symlink first with `$(readlink -f /var/lib/machines/<image>)` because `systemd 252` rejects symlinks in `RootDirectory=` with `226/NAMESPACE`.
