@@ -4,7 +4,7 @@ set -eu
 CRED_DIR="${CREDENTIALS_DIRECTORY:-/run/credentials}"
 
 usage() {
-    echo "Usage: $0 {start|stop|inspect <image>}" >&2
+    echo "Usage: $0 {start|stop|inspect <image>|execute [options] <image> ...}" >&2
     exit 1
 }
 
@@ -67,6 +67,45 @@ read_xattr() {
     attr_name="$1"
     attr_path="$2"
     getfattr --absolute-names --only-values -n "$attr_name" "$attr_path" 2>/dev/null
+}
+
+resolve_default_stage1() {
+    if [ -d /var/lib/machines/stage1-default ]; then
+        printf 'stage1-default'
+        return 0
+    fi
+    if [ -d /var/lib/machines/stage1-debian ]; then
+        printf 'stage1-debian'
+        return 0
+    fi
+    raw_arch="$(dpkg --print-architecture 2>/dev/null || uname -m)"
+    case "$raw_arch" in
+        x86_64)    host_arch="amd64" ;;
+        aarch64)   host_arch="arm64" ;;
+        i386|i686) host_arch="i386" ;;
+        *)         host_arch="$raw_arch" ;;
+    esac
+    cand="$(
+        for d in "/var/lib/machines/stage1-${host_arch}-"*; do
+            [ -d "$d" ] || continue
+            printf '%s\n' "${d##*/}"
+        done | sort -V | tail -n 1
+    )"
+    if [ -n "$cand" ]; then
+        printf '%s' "$cand"
+        return 0
+    fi
+    cand="$(
+        for d in /var/lib/machines/stage1-*; do
+            [ -d "$d" ] || continue
+            printf '%s\n' "${d##*/}"
+        done | sort -V | tail -n 1
+    )"
+    if [ -n "$cand" ]; then
+        printf '%s' "$cand"
+        return 0
+    fi
+    printf 'stage1-debian'
 }
 
 setup_network() {
@@ -185,9 +224,12 @@ cmd_start() {
     setup_network
 
     # 3. Canonicalise Stage 1 image symlink and mount per-pod Stage 1 overlay
-    STAGE1_IMAGE="stage1-debian"
+    STAGE1_IMAGE=""
     if [ -f "${CRED_DIR}/pod.stage1" ]; then
         STAGE1_IMAGE="$(tr -d ' \t\r\n' < "${CRED_DIR}/pod.stage1")"
+    fi
+    if [ -z "$STAGE1_IMAGE" ]; then
+        STAGE1_IMAGE="$(resolve_default_stage1)"
     fi
 
     STAGE1_LINK="/var/lib/machines/${STAGE1_IMAGE}"
@@ -594,18 +636,45 @@ EOF
 
     ensure_stage1_shell_alias "stage1"
 
+    nl='
+'
     for cred in "${CRED_DIR}"/pod.app.*; do
         if [ ! -f "$cred" ]; then
             continue
         fi
         app_id="${cred##*pod.app.}"
-        spec="$(tr -d '\r\n' < "$cred")"
-        case "$spec" in
-            *=*)
-                img_name="$(read_kv image "$spec" || true)"
+        raw_spec="$(tr -d '\r' < "$cred")"
+        case "$raw_spec" in
+            *"$nl"*)
+                spec_delim="$nl"
+                spec="$raw_spec"
                 ;;
             *)
-                img_name="$(printf '%s' "$spec" | tr -d ' \t')"
+                spec_delim=","
+                spec="$raw_spec"
+                ;;
+        esac
+
+        img_name=""
+        case "$spec" in
+            *=*)
+                old_ifs="$IFS"
+                set -f
+                IFS="$spec_delim"
+                for pair in $spec; do
+                    [ -n "$pair" ] || continue
+                    k="${pair%%=*}"
+                    v="${pair#*=}"
+                    if [ "$k" = "image" ]; then
+                        img_name="$v"
+                        break
+                    fi
+                done
+                IFS="$old_ifs"
+                set +f
+                ;;
+            *)
+                img_name="$(printf '%s' "$spec" | tr -d ' \t\n')"
                 ;;
         esac
 
@@ -664,15 +733,14 @@ EOF
         unit_lines=""
         svc_lines=""
         has_exec_override=0
-        nl='
-'
 
         case "$spec" in
             *=*)
                 old_ifs="$IFS"
                 set -f
-                IFS=','
+                IFS="$spec_delim"
                 for pair in $spec; do
+                    [ -n "$pair" ] || continue
                     k="${pair%%=*}"
                     v="${pair#*=}"
                     case "$k" in
@@ -907,9 +975,368 @@ cmd_inspect() {
     fi
 }
 
+quote_systemd_arg() {
+    q_arg="$1"
+    if [ -z "$q_arg" ]; then
+        printf '""'
+        return 0
+    fi
+    q_pct="$(printf '%s' "$q_arg" | sed 's/%/%%/g')"
+    case "$q_pct" in
+        *[[:space:]]*|*\"*|*\'*|*\\*|*\;*|*\$*|*\`*|*\|*)
+            q_esc="$(printf '%s' "$q_pct" | sed 's/\\/\\\\/g; s/"/\\"/g')"
+            printf '"%s"' "$q_esc"
+            ;;
+        *)
+            printf '%s' "$q_pct"
+            ;;
+    esac
+}
+
+validate_app_name() {
+    v_app="$1"
+    if ! printf '%s' "$v_app" | grep -Eq '^[a-z][a-z0-9_-]{0,30}$'; then
+        echo "pod-runtime execute: invalid application name '${v_app}'" >&2
+        exit 1
+    fi
+    case "$v_app" in
+        root|stage1|nobody|messagebus|systemd-*|pod-uid-*|pod-gid-*)
+            echo "pod-runtime execute: application name '${v_app}' is reserved by Stage 1" >&2
+            exit 1
+            ;;
+    esac
+    case " ${SEEN_APPS} " in
+        *" ${v_app} "*)
+            echo "pod-runtime execute: duplicate application name '${v_app}' in pod" >&2
+            exit 1
+            ;;
+    esac
+    SEEN_APPS="${SEEN_APPS:+${SEEN_APPS} }${v_app}"
+}
+
+cmd_execute() {
+    PLAN_OUT=""
+    SEEN_APPS=""
+    priv_net=0
+    vol_ro_list=" "
+    vol_dst_map=""
+    cur_app=""
+    cur_img=""
+    cur_props=""
+    cur_binds=""
+    cur_ro_binds=""
+    cur_has_comma=0
+    nl='
+'
+
+    emit_cred() {
+        c_id="$1"
+        c_val="$2"
+        escaped_val="$(printf '%s' "$c_val" \
+            | sed 's/\\/\\\\/g; s/ /\\x20/g; s/	/\\x09/g; s/\*/\\x2a/g; s/?/\\x3f/g; s/\[/\\x5b/g' \
+            | awk 'NR > 1 { printf "\\n" } { printf "%s", $0 }')"
+        PLAN_OUT="${PLAN_OUT}${PLAN_OUT:+${nl}}-p${nl}SetCredential=${c_id}:${escaped_val}"
+    }
+
+    flush_app() {
+        [ -n "$cur_img" ] || return 0
+        if [ -z "$cur_app" ]; then
+            cur_app="$(printf '%s' "$cur_img" | sed 's/[-_].*$//')"
+            [ -n "$cur_app" ] || cur_app="app"
+        fi
+        validate_app_name "$cur_app"
+
+        case "${cur_img}${cur_binds}${cur_ro_binds}" in
+            *,*) cur_has_comma=1 ;;
+        esac
+
+        if [ "$cur_has_comma" -eq 1 ]; then
+            sep="$nl"
+        else
+            sep=","
+        fi
+
+        app_spec="image=${cur_img}"
+        if [ -n "$cur_binds" ]; then
+            app_spec="${app_spec}${sep}BindPaths=${cur_binds}"
+        fi
+        if [ -n "$cur_ro_binds" ]; then
+            app_spec="${app_spec}${sep}BindReadOnlyPaths=${cur_ro_binds}"
+        fi
+        if [ -n "$cur_props" ]; then
+            if [ "$cur_has_comma" -eq 1 ]; then
+                app_spec="${app_spec}${nl}${cur_props}"
+            else
+                p_flat="$(printf '%s' "$cur_props" | tr '\n' ',')"
+                app_spec="${app_spec},${p_flat}"
+            fi
+        fi
+
+        if [ "$app_spec" = "image=${cur_img}" ]; then
+            emit_cred "pod.app.${cur_app}" "${cur_img}"
+        else
+            emit_cred "pod.app.${cur_app}" "${app_spec}"
+        fi
+
+        cur_app=""
+        cur_img=""
+        cur_props=""
+        cur_binds=""
+        cur_ro_binds=""
+        cur_has_comma=0
+    }
+
+    require_open_app() {
+        if [ -z "$cur_img" ]; then
+            echo "pod-runtime execute: application option '$1' must follow an image name" >&2
+            exit 1
+        fi
+    }
+
+    append_app_prop() {
+        require_open_app "$1"
+        case "$1" in
+            *,*) cur_has_comma=1 ;;
+        esac
+        cur_props="${cur_props:+${cur_props}${nl}}$1"
+    }
+
+    lookup_vol_dst() {
+        l_vol="$1"
+        l_found="$(printf '%s\n' "$vol_dst_map" | awk -F= -v k="$l_vol" '$1 == k {print substr($0, index($0, "=") + 1); exit}')"
+        if [ -n "$l_found" ]; then
+            printf '%s' "$l_found"
+        else
+            printf '/vol/%s' "$l_vol"
+        fi
+    }
+
+    while [ "$#" -gt 0 ]; do
+        tok="$1"
+        shift
+        case "$tok" in
+            ---)
+                flush_app
+                ;;
+            --)
+                require_open_app "--"
+                exec_cmd=""
+                while [ "$#" -gt 0 ] && [ "$1" != "---" ]; do
+                    q_tok="$(quote_systemd_arg "$1")"
+                    exec_cmd="${exec_cmd:+${exec_cmd} }${q_tok}"
+                    shift
+                done
+                if [ -z "$exec_cmd" ]; then
+                    echo "pod-runtime execute: '--' requires a command" >&2
+                    exit 1
+                fi
+                append_app_prop "ExecStart=${exec_cmd}"
+                if [ "${1:-}" = "---" ]; then
+                    shift
+                    flush_app
+                fi
+                ;;
+            --net=host)
+                priv_net=0
+                ;;
+            --net=private|-n)
+                priv_net=1
+                ;;
+            --net=*)
+                priv_net=1
+                n_val="${tok#--net=}"
+                n_id="${n_val%%:*}"
+                n_spec="${n_val#*:}"
+                if [ -z "$n_id" ] || [ "$n_id" = "$n_val" ]; then
+                    echo "pod-runtime execute: --net requires <id>:<k=v,...>, 'private', or 'host'" >&2
+                    exit 1
+                fi
+                emit_cred "net.if.${n_id}" "$n_spec"
+                ;;
+            --dns=*)
+                emit_cred "net.dns" "${tok#--dns=}"
+                ;;
+            --hostname=*)
+                emit_cred "pod.hostname" "${tok#--hostname=}"
+                ;;
+            --stage1=*)
+                emit_cred "pod.stage1" "${tok#--stage1=}"
+                ;;
+            --caps=*)
+                emit_cred "pod.caps" "${tok#--caps=}"
+                ;;
+            --journal=*)
+                emit_cred "pod.journal" "${tok#--journal=}"
+                ;;
+            --volume=*)
+                v_spec="${tok#--volume=}"
+                v_name="${v_spec%%,*}"
+                v_rest="${v_spec#*,}"
+                if [ -z "$v_name" ] || [ "$v_name" = "$v_spec" ]; then
+                    echo "pod-runtime execute: invalid --volume specification '${v_spec}'" >&2
+                    exit 1
+                fi
+                v_kind="$(read_kv kind "$v_rest" || printf 'empty')"
+                if [ "$v_kind" = "host" ]; then
+                    v_src="$(read_kv source "$v_rest" || read_kv src "$v_rest" || true)"
+                    if [ -z "$v_src" ]; then
+                        echo "pod-runtime execute: host volume '${v_name}' requires source=<path>" >&2
+                        exit 1
+                    fi
+                    v_dst="$(read_kv target "$v_rest" || read_kv dst "$v_rest" || printf '/vol/%s' "$v_name")"
+                    v_ro="$(read_kv readOnly "$v_rest" || read_kv ro "$v_rest" || printf 'false')"
+                    emit_cred "host.bind.${v_name}" "src=${v_src},dst=${v_dst},ro=${v_ro}"
+                    vol_dst_map="${vol_dst_map}${vol_dst_map:+${nl}}${v_name}=${v_dst}"
+                    if [ "$v_ro" = "true" ]; then
+                        vol_ro_list="${vol_ro_list}${v_name} "
+                    fi
+                else
+                    v_mode="$(read_kv mode "$v_rest" || printf '0755')"
+                    v_uid="$(read_kv uid "$v_rest" || printf '0')"
+                    v_gid="$(read_kv gid "$v_rest" || printf '0')"
+                    emit_cred "vol.${v_name}" "mode=${v_mode},uid=${v_uid},gid=${v_gid}"
+                    vol_dst_map="${vol_dst_map}${vol_dst_map:+${nl}}${v_name}=/vol/${v_name}"
+                fi
+                ;;
+            --name=*)
+                require_open_app "$tok"
+                cur_app="${tok#--name=}"
+                ;;
+            --exec=*)
+                append_app_prop "ExecStart=${tok#--exec=}"
+                ;;
+            --mount=*)
+                m_spec="${tok#--mount=}"
+                require_open_app "$tok"
+                m_vol="$(read_kv volume "$m_spec" || true)"
+                m_dst="$(read_kv target "$m_spec" || read_kv dst "$m_spec" || true)"
+                if [ -z "$m_vol" ] || [ -z "$m_dst" ]; then
+                    echo "pod-runtime execute: --mount requires volume=<name>,target=<path>" >&2
+                    exit 1
+                fi
+                m_src="$(lookup_vol_dst "$m_vol")"
+                m_ro="$(read_kv readOnly "$m_spec" || read_kv ro "$m_spec" || printf 'false')"
+                case "$vol_ro_list" in
+                    *" ${m_vol} "*) m_ro="true" ;;
+                esac
+                if [ "$m_ro" = "true" ]; then
+                    cur_ro_binds="${cur_ro_binds:+${cur_ro_binds} }${m_src}:${m_dst}"
+                else
+                    cur_binds="${cur_binds:+${cur_binds} }${m_src}:${m_dst}"
+                fi
+                ;;
+            --bind=*)
+                require_open_app "$tok"
+                cur_binds="${cur_binds:+${cur_binds} }${tok#--bind=}"
+                ;;
+            --bind-ro=*)
+                require_open_app "$tok"
+                cur_ro_binds="${cur_ro_binds:+${cur_ro_binds} }${tok#--bind-ro=}"
+                ;;
+            --after=*)
+                a_unit="${tok#--after=}"
+                case "$a_unit" in *.service) ;; *) a_unit="${a_unit}.service" ;; esac
+                append_app_prop "After=${a_unit}"
+                ;;
+            --before=*)
+                b_unit="${tok#--before=}"
+                case "$b_unit" in *.service) ;; *) b_unit="${b_unit}.service" ;; esac
+                append_app_prop "Before=${b_unit}"
+                ;;
+            --requires=*)
+                r_unit="${tok#--requires=}"
+                case "$r_unit" in *.service) ;; *) r_unit="${r_unit}.service" ;; esac
+                append_app_prop "Requires=${r_unit}"
+                ;;
+            --memory=*)
+                append_app_prop "MemoryMax=${tok#--memory=}"
+                ;;
+            --cpu=*)
+                append_app_prop "CPUQuota=${tok#--cpu=}"
+                ;;
+            --tasks=*)
+                append_app_prop "TasksMax=${tok#--tasks=}"
+                ;;
+            --user=*)
+                append_app_prop "User=${tok#--user=}"
+                ;;
+            --group=*)
+                append_app_prop "Group=${tok#--group=}"
+                ;;
+            --app-caps=*)
+                c_list="$(printf '%s' "${tok#--app-caps=}" | tr ',' ' ')"
+                append_app_prop "CapabilityBoundingSet=${c_list}"
+                ;;
+            --env=*)
+                env_raw="${tok#--env=}"
+                case "$env_raw" in
+                    *=*)
+                        env_k="${env_raw%%=*}"
+                        if ! printf '%s' "$env_k" | grep -Eq '^[A-Za-z_][A-Za-z0-9_]*$'; then
+                            echo "pod-runtime execute: invalid environment variable name in '${tok}'" >&2
+                            exit 1
+                        fi
+                        ;;
+                    *)
+                        echo "pod-runtime execute: '--env=' requires KEY=VALUE" >&2
+                        exit 1
+                        ;;
+                esac
+                env_esc="$(printf '%s' "$env_raw" | sed 's/\\/\\\\/g; s/"/\\"/g; s/%/%%/g')"
+                append_app_prop "Environment=\"${env_esc}\""
+                ;;
+            --working-dir=*)
+                append_app_prop "WorkingDirectory=${tok#--working-dir=}"
+                ;;
+            --directive=*)
+                d_raw="${tok#--directive=}"
+                case "$d_raw" in
+                    *=*) ;;
+                    *)
+                        echo "pod-runtime execute: '--directive=' requires Key=Value" >&2
+                        exit 1
+                        ;;
+                esac
+                append_app_prop "$d_raw"
+                ;;
+            -*)
+                echo "pod-runtime execute: unknown option '${tok}'" >&2
+                exit 1
+                ;;
+            *=*)
+                flush_app
+                cur_app="${tok%%=*}"
+                cur_img="${tok#*=}"
+                if [ -z "$cur_app" ] || [ -z "$cur_img" ]; then
+                    echo "pod-runtime execute: invalid <app>=<image> specification '${tok}'" >&2
+                    exit 1
+                fi
+                ;;
+            *)
+                flush_app
+                cur_img="$tok"
+                ;;
+        esac
+    done
+
+    flush_app
+
+    if [ -z "$SEEN_APPS" ]; then
+        echo "pod-runtime execute: at least one Stage 2 application image is required" >&2
+        exit 1
+    fi
+
+    printf -- '--collect\n'
+    if [ "$priv_net" -eq 1 ]; then
+        printf -- '-p\nPrivateNetwork=yes\n'
+    fi
+    printf '%s\n/usr/lib/systemd/pod-runtime\nstart\n' "$PLAN_OUT"
+}
+
 case "${1:-}" in
     start)   cmd_start ;;
     stop)    cmd_stop ;;
     inspect) shift; cmd_inspect "$@" ;;
+    execute) shift; cmd_execute "$@" ;;
     *)       usage ;;
 esac
