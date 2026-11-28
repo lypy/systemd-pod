@@ -138,7 +138,7 @@ sudo machinectl read-only stage1-debian yes
 
 ## Installing the host scripts
 
-Install the six host scripts from [`host/usr/lib/systemd/`](host/usr/lib/systemd/) into `/usr/lib/systemd/`:
+Install the four host scripts from [`host/usr/lib/systemd/`](host/usr/lib/systemd/) into `/usr/lib/systemd/`:
 
 * [`host/usr/lib/systemd/pod-runtime`](host/usr/lib/systemd/pod-runtime)
 * [`host/usr/lib/systemd/pod-image-seal`](host/usr/lib/systemd/pod-image-seal)
