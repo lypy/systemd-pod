@@ -74,6 +74,25 @@ mount -t overlay overlay \
     -o "lowerdir=${STAGE1_LOWER},upperdir=${RUN_DIR}/stage1-upper,workdir=${RUN_DIR}/stage1-work" \
     "${STAGE1_ROOT}"
 
+# Prune unused Debian base-passwd stub accounts so app names such as list,
+# proxy, mail, www-data, backup, and sync can be registered as UID 0 shell aliases.
+awk -F: '$1 == "root" || $1 == "nobody" || $1 == "messagebus" || $1 ~ /^systemd-/' \
+    "${STAGE1_ROOT}/etc/passwd" > "${STAGE1_ROOT}/etc/passwd.tmp"
+chmod 0644 "${STAGE1_ROOT}/etc/passwd.tmp"
+mv -f "${STAGE1_ROOT}/etc/passwd.tmp" "${STAGE1_ROOT}/etc/passwd"
+
+if [ -f "${STAGE1_ROOT}/etc/shadow" ]; then
+    awk -F: '$1 == "root" || $1 == "nobody" || $1 == "messagebus" || $1 ~ /^systemd-/' \
+        "${STAGE1_ROOT}/etc/shadow" > "${STAGE1_ROOT}/etc/shadow.tmp"
+    chmod 0640 "${STAGE1_ROOT}/etc/shadow.tmp"
+    mv -f "${STAGE1_ROOT}/etc/shadow.tmp" "${STAGE1_ROOT}/etc/shadow"
+fi
+
+if [ -f /usr/lib/systemd/pod-enter.sh ]; then
+    mkdir -p "${STAGE1_ROOT}/etc/profile.d"
+    install -m 0644 /usr/lib/systemd/pod-enter.sh "${STAGE1_ROOT}/etc/profile.d/pod-enter.sh"
+fi
+
 printf '%s\n' "${POD_HOSTNAME}" > "${STAGE1_ROOT}/etc/hostname"
 printf '%s\n' "${POD_MACHINE_ID}" > "${STAGE1_ROOT}/etc/machine-id"
 
@@ -196,96 +215,239 @@ prepare_bind_mountpoints() {
 
 NEED_SETUID_CAPS=0
 
-ensure_stage1_gid() {
-    g_spec="$1"
-    [ -n "$g_spec" ] || return 0
+ensure_stage1_numeric_gid() {
+    gid_num="$1"
+    [ -n "$gid_num" ] || return 0
     NEED_SETUID_CAPS=1
-    case "$g_spec" in
-        *[!0-9]*)
-            if ! awk -F: -v n="$g_spec" '$1 == n {found=1} END {exit !found}' "${STAGE1_ROOT}/etc/group"; then
-                if [ -f "${app_merged}/etc/group" ]; then
-                    g_line="$(awk -F: -v n="$g_spec" '$1 == n {print; exit}' "${app_merged}/etc/group")"
-                    if [ -n "$g_line" ]; then
-                        printf '%s\n' "$g_line" >> "${STAGE1_ROOT}/etc/group"
-                    fi
-                fi
-            fi
-            ;;
-        *)
-            if ! awk -F: -v id="$g_spec" '$3 == id {found=1} END {exit !found}' "${STAGE1_ROOT}/etc/group"; then
-                printf 'pod-gid-%s:x:%s:\n' "$g_spec" "$g_spec" >> "${STAGE1_ROOT}/etc/group"
-            fi
-            ;;
-    esac
-}
-
-ensure_stage1_uid() {
-    u_spec="$1"
-    [ -n "$u_spec" ] || return 0
-    NEED_SETUID_CAPS=1
-    case "$u_spec" in
-        *[!0-9]*)
-            if ! awk -F: -v n="$u_spec" '$1 == n {found=1} END {exit !found}' "${STAGE1_ROOT}/etc/passwd"; then
-                if [ -f "${app_merged}/etc/passwd" ]; then
-                    u_line="$(awk -F: -v n="$u_spec" '$1 == n {print; exit}' "${app_merged}/etc/passwd")"
-                    if [ -n "$u_line" ]; then
-                        printf '%s\n' "$u_line" >> "${STAGE1_ROOT}/etc/passwd"
-                        u_gid="$(printf '%s' "$u_line" | cut -d: -f4)"
-                        ensure_stage1_gid "$u_gid"
-                    fi
-                fi
-            fi
-            ;;
-        *)
-            if ! awk -F: -v id="$u_spec" '$3 == id {found=1} END {exit !found}' "${STAGE1_ROOT}/etc/passwd"; then
-                u_gid="$u_spec"
-                if [ -f "${app_merged}/etc/passwd" ]; then
-                    found_gid="$(awk -F: -v id="$u_spec" '$3 == id {print $4; exit}' "${app_merged}/etc/passwd")"
-                    if [ -n "$found_gid" ]; then
-                        u_gid="$found_gid"
-                    fi
-                fi
-                printf 'pod-uid-%s:x:%s:%s::/nonexistent:/usr/sbin/nologin\n' "$u_spec" "$u_spec" "$u_gid" >> "${STAGE1_ROOT}/etc/passwd"
-                ensure_stage1_gid "$u_gid"
-            fi
-            ;;
-    esac
-}
-
-ensure_stage1_sup_groups() {
-    sg_list="$1"
-    [ -n "$sg_list" ] || return 0
-    sg_old_ifs="$IFS"
-    case "$-" in
-        *f*) sg_had_noglob=1 ;;
-        *)   sg_had_noglob=0; set -f ;;
-    esac
-    IFS=' '
-    for sg in $sg_list; do
-        ensure_stage1_gid "$sg"
-    done
-    IFS="$sg_old_ifs"
-    if [ "$sg_had_noglob" -eq 0 ]; then
-        set +f
+    if ! awk -F: -v id="$gid_num" '$3 == id {found=1} END {exit !found}' "${STAGE1_ROOT}/etc/group"; then
+        printf 'pod-gid-%s:x:%s:\n' "$gid_num" "$gid_num" >> "${STAGE1_ROOT}/etc/group"
     fi
 }
 
-sync_stage1_identities_from_file() {
-    cfg_file="$1"
-    [ -f "$cfg_file" ] || return 0
-    while IFS= read -r cfg_line || [ -n "$cfg_line" ]; do
-        case "$cfg_line" in
-            User=*)
-                ensure_stage1_uid "${cfg_line#User=}"
+ensure_stage1_numeric_uid() {
+    uid_num="$1"
+    gid_num="$2"
+    home_dir="${3:-/nonexistent}"
+    [ -n "$uid_num" ] || return 0
+    [ -n "$gid_num" ] || gid_num="$uid_num"
+    [ -n "$home_dir" ] || home_dir="/nonexistent"
+    NEED_SETUID_CAPS=1
+    ensure_stage1_numeric_gid "$gid_num"
+    if ! awk -F: -v id="$uid_num" '$3 == id {found=1} END {exit !found}' "${STAGE1_ROOT}/etc/passwd"; then
+        printf 'pod-uid-%s:x:%s:%s::%s:/usr/sbin/nologin\n' "$uid_num" "$uid_num" "$gid_num" "$home_dir" >> "${STAGE1_ROOT}/etc/passwd"
+    fi
+}
+
+resolve_stage2_gid() {
+    g_spec="$1"
+    s2_root="$2"
+    case "$g_spec" in
+        "")
+            return 1
+            ;;
+        *[!0-9]*)
+            if [ -f "${s2_root}/etc/group" ]; then
+                g_num="$(awk -F: -v n="$g_spec" '$1 == n {print $3; exit}' "${s2_root}/etc/group")"
+                if [ -n "$g_num" ]; then
+                    printf '%s' "$g_num"
+                    return 0
+                fi
+            fi
+            return 1
+            ;;
+        *)
+            printf '%s' "$g_spec"
+            return 0
+            ;;
+    esac
+}
+
+ensure_stage1_shell_alias() {
+    alias_name="$1"
+    [ -n "$alias_name" ] || return 0
+    existing_uid="$(awk -F: -v n="$alias_name" '$1 == n {print $3; exit}' "${STAGE1_ROOT}/etc/passwd")"
+    if [ -n "$existing_uid" ]; then
+        if [ "$existing_uid" != "0" ]; then
+            echo "Shell alias '${alias_name}' collides with non-root user (uid=${existing_uid}) in Stage 1 /etc/passwd" >&2
+            return 1
+        fi
+        return 0
+    fi
+    printf '%s:x:0:0:Pod layer %s:/root:/bin/bash\n' "$alias_name" "$alias_name" >> "${STAGE1_ROOT}/etc/passwd"
+    if [ -f "${STAGE1_ROOT}/etc/shadow" ]; then
+        printf '%s:*:19000:0:99999:7:::\n' "$alias_name" >> "${STAGE1_ROOT}/etc/shadow"
+    fi
+}
+
+sync_stage2_app_identity() {
+    s2_dropin_dir="$1"
+    s2_root="$2"
+    s2_app_id="$3"
+    s2_img="$4"
+
+    eff_user=""
+    eff_group=""
+    eff_sup=""
+    has_sup_directive=0
+
+    for id_cfg in "${s2_dropin_dir}/10-image.conf" "${s2_dropin_dir}/20-credential.conf"; do
+        [ -f "$id_cfg" ] || continue
+        while IFS= read -r cfg_line || [ -n "$cfg_line" ]; do
+            case "$cfg_line" in
+                User=*)
+                    eff_user="${cfg_line#User=}"
+                    ;;
+                Group=*)
+                    eff_group="${cfg_line#Group=}"
+                    ;;
+                SupplementaryGroups=*)
+                    has_sup_directive=1
+                    sup_val="${cfg_line#SupplementaryGroups=}"
+                    if [ -z "$sup_val" ]; then
+                        eff_sup=""
+                    else
+                        eff_sup="${eff_sup:+${eff_sup} }${sup_val}"
+                    fi
+                    ;;
+            esac
+        done < "$id_cfg"
+    done
+
+    resolved_uid=""
+    resolved_gid=""
+    u_name=""
+    u_gid=""
+    u_home=""
+
+    if [ -n "$eff_user" ] && [ "$eff_user" != "0" ] && [ "$eff_user" != "root" ]; then
+        case "$eff_user" in
+            *[!0-9]*)
+                if [ ! -f "${s2_root}/etc/passwd" ]; then
+                    echo "User '${eff_user}' for app '${s2_app_id}' cannot be resolved: ${s2_img} has no /etc/passwd" >&2
+                    return 1
+                fi
+                u_line="$(awk -F: -v n="$eff_user" '$1 == n {print; exit}' "${s2_root}/etc/passwd")"
+                if [ -z "$u_line" ]; then
+                    echo "User '${eff_user}' for app '${s2_app_id}' not found in ${s2_img} /etc/passwd" >&2
+                    return 1
+                fi
+                u_name="$(printf '%s' "$u_line" | cut -d: -f1)"
+                resolved_uid="$(printf '%s' "$u_line" | cut -d: -f3)"
+                u_gid="$(printf '%s' "$u_line" | cut -d: -f4)"
+                u_home="$(printf '%s' "$u_line" | cut -d: -f6)"
                 ;;
-            Group=*)
-                ensure_stage1_gid "${cfg_line#Group=}"
-                ;;
-            SupplementaryGroups=*)
-                ensure_stage1_sup_groups "${cfg_line#SupplementaryGroups=}"
+            *)
+                resolved_uid="$eff_user"
+                u_gid="$eff_user"
+                if [ -f "${s2_root}/etc/passwd" ]; then
+                    u_line="$(awk -F: -v id="$eff_user" '$3 == id {print; exit}' "${s2_root}/etc/passwd")"
+                    if [ -n "$u_line" ]; then
+                        u_name="$(printf '%s' "$u_line" | cut -d: -f1)"
+                        u_gid="$(printf '%s' "$u_line" | cut -d: -f4)"
+                        u_home="$(printf '%s' "$u_line" | cut -d: -f6)"
+                    fi
+                fi
                 ;;
         esac
-    done < "$cfg_file"
+        ensure_stage1_numeric_uid "$resolved_uid" "$u_gid" "${u_home:-/nonexistent}"
+    fi
+
+    if [ -n "$eff_group" ]; then
+        if [ "$eff_group" = "0" ] || [ "$eff_group" = "root" ]; then
+            resolved_gid="0"
+        else
+            resolved_gid="$(resolve_stage2_gid "$eff_group" "$s2_root")" || {
+                echo "Group '${eff_group}' for app '${s2_app_id}' not found in ${s2_img} /etc/group" >&2
+                return 1
+            }
+            ensure_stage1_numeric_gid "$resolved_gid"
+        fi
+    elif [ -n "$u_gid" ]; then
+        resolved_gid="$u_gid"
+    fi
+
+    # Collect supplementary GIDs from Stage 2 /etc/group memberships for u_name
+    # and explicit SupplementaryGroups= entries so initgroups() semantics match Stage 2.
+    resolved_sup_gids=""
+    if [ -n "$u_name" ] && [ -f "${s2_root}/etc/group" ]; then
+        member_gids="$(awk -F: -v u="$u_name" '{
+            n = split($4, members, ",")
+            for (i = 1; i <= n; i++) {
+                if (members[i] == u) {
+                    print $3
+                    break
+                }
+            }
+        }' "${s2_root}/etc/group")"
+        for mg in $member_gids; do
+            [ -n "$mg" ] || continue
+            ensure_stage1_numeric_gid "$mg"
+            case " ${resolved_sup_gids} " in
+                *" ${mg} "*) ;;
+                *) resolved_sup_gids="${resolved_sup_gids:+${resolved_sup_gids} }${mg}" ;;
+            esac
+        done
+    fi
+
+    if [ -n "$eff_sup" ]; then
+        sg_old_ifs="$IFS"
+        case "$-" in
+            *f*) sg_had_noglob=1 ;;
+            *)   sg_had_noglob=0; set -f ;;
+        esac
+        IFS=' '
+        for sg in $eff_sup; do
+            sg_num="$(resolve_stage2_gid "$sg" "$s2_root")" || {
+                echo "SupplementaryGroup '${sg}' for app '${s2_app_id}' not found in ${s2_img} /etc/group" >&2
+                IFS="$sg_old_ifs"
+                if [ "$sg_had_noglob" -eq 0 ]; then
+                    set +f
+                fi
+                return 1
+            }
+            ensure_stage1_numeric_gid "$sg_num"
+            case " ${resolved_sup_gids} " in
+                *" ${sg_num} "*) ;;
+                *) resolved_sup_gids="${resolved_sup_gids:+${resolved_sup_gids} }${sg_num}" ;;
+            esac
+        done
+        IFS="$sg_old_ifs"
+        if [ "$sg_had_noglob" -eq 0 ]; then
+            set +f
+        fi
+    fi
+
+    # Layer 05: Default Stage 2 USER/LOGNAME/HOME before 10-image.conf and 20-credential.conf
+    if [ -n "$u_name" ] || [ -n "$u_home" ]; then
+        {
+            printf '[Service]\n'
+            if [ -n "$u_name" ]; then
+                printf 'Environment="USER=%s" "LOGNAME=%s"\n' "$u_name" "$u_name"
+            fi
+            if [ -n "$u_home" ]; then
+                printf 'Environment="HOME=%s"\n' "$u_home"
+            fi
+        } > "${s2_dropin_dir}/05-identity-env.conf"
+    fi
+
+    # Layer 30: Override symbolic/numeric identities with Stage 1 numeric IDs
+    if [ -n "$resolved_uid" ] || [ -n "$resolved_gid" ] || [ -n "$resolved_sup_gids" ] || [ "$has_sup_directive" -eq 1 ]; then
+        {
+            printf '[Service]\n'
+            if [ -n "$resolved_uid" ]; then
+                printf 'User=%s\n' "$resolved_uid"
+            fi
+            if [ -n "$resolved_gid" ]; then
+                printf 'Group=%s\n' "$resolved_gid"
+            fi
+            if [ -n "$resolved_sup_gids" ] || [ "$has_sup_directive" -eq 1 ]; then
+                printf 'SupplementaryGroups=\n'
+                if [ -n "$resolved_sup_gids" ]; then
+                    printf 'SupplementaryGroups=%s\n' "$resolved_sup_gids"
+                fi
+            fi
+        } > "${s2_dropin_dir}/30-identity.conf"
+    fi
 }
 
 # 5. Mount each Stage 2 application overlay and emit its native Stage 1 systemd unit
@@ -299,6 +461,8 @@ mkdir -p "${STAGE1_ROOT}/opt/stage2" "${RUN_DIR}/app-rootfs" "${RUN_DIR}/app-upp
     printf '[Service]\n'
     printf 'LogExtraFields=POD_UNIT=%s\n' "${MACHINE_NAME}"
 } > "${UNIT_DIR}/pod-stdio@.service.d/10-pod-unit.conf"
+
+ensure_stage1_shell_alias "stage1"
 
 for cred in "${CRED_DIR}"/pod.app.*; do
     if [ ! -f "$cred" ]; then
@@ -435,7 +599,6 @@ EOF
     # Layer 10: Stage 2 image defaults from /etc/pod.service
     if [ -f "${img_dir}/etc/pod.service" ]; then
         cp "${img_dir}/etc/pod.service" "${dropin_dir}/10-image.conf"
-        sync_stage1_identities_from_file "${dropin_dir}/10-image.conf"
     fi
 
     # Layer 20: Per-pod credential overrides from SetCredential=pod.app.<app_id>
@@ -448,8 +611,12 @@ EOF
                 printf '[Service]\n%s' "${svc_lines}"
             fi
         } > "${dropin_dir}/20-credential.conf"
-        sync_stage1_identities_from_file "${dropin_dir}/20-credential.conf"
     fi
+
+    # Layers 05 and 30: Resolve symbolic/numeric Stage 2 identities to hidden numeric
+    # Stage 1 accounts so Stage 2 app names remain free for UID 0 shell aliases.
+    sync_stage2_app_identity "${dropin_dir}" "${app_merged}" "${app_id}" "${img_name}"
+    ensure_stage1_shell_alias "${app_id}"
 
     ln -sf "../${app_id}.service" "${UNIT_DIR}/pod-idle.target.wants/${app_id}.service"
 

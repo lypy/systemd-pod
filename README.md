@@ -356,11 +356,11 @@ sudo nsenter --target "${MACHINE_PID}" --mount --root --pid mount
   ```
 * Target a specific application in a multi-application pod:
   ```sh
-  sudo machinectl shell --setenv=POD_APP=zebra pod-bgp
+  sudo machinectl shell zebra@pod-bgp
   ```
 * Remain in the stage 1 Debian supervisor shell without entering stage 2:
   ```sh
-  sudo machinectl shell --setenv=POD_STAGE1_STAY=1 pod-bgp
+  sudo machinectl shell stage1@pod-bgp
   ```
 
 ### Execute a one-off management command inside a stage 2 application
