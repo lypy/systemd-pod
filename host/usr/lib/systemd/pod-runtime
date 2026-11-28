@@ -209,25 +209,6 @@ cmd_start() {
         -o "lowerdir=${STAGE1_LOWER},upperdir=${RUN_DIR}/stage1-upper,workdir=${RUN_DIR}/stage1-work" \
         "${STAGE1_ROOT}"
 
-    # Prune unused Debian base-passwd stub accounts so app names such as list,
-    # proxy, mail, www-data, backup, and sync can be registered as UID 0 shell aliases.
-    awk -F: '$1 == "root" || $1 == "nobody" || $1 == "messagebus" || $1 ~ /^systemd-/' \
-        "${STAGE1_ROOT}/etc/passwd" > "${STAGE1_ROOT}/etc/passwd.tmp"
-    chmod 0644 "${STAGE1_ROOT}/etc/passwd.tmp"
-    mv -f "${STAGE1_ROOT}/etc/passwd.tmp" "${STAGE1_ROOT}/etc/passwd"
-
-    if [ -f "${STAGE1_ROOT}/etc/shadow" ]; then
-        awk -F: '$1 == "root" || $1 == "nobody" || $1 == "messagebus" || $1 ~ /^systemd-/' \
-            "${STAGE1_ROOT}/etc/shadow" > "${STAGE1_ROOT}/etc/shadow.tmp"
-        chmod 0640 "${STAGE1_ROOT}/etc/shadow.tmp"
-        mv -f "${STAGE1_ROOT}/etc/shadow.tmp" "${STAGE1_ROOT}/etc/shadow"
-    fi
-
-    if [ -f /usr/lib/systemd/pod-enter.sh ]; then
-        mkdir -p "${STAGE1_ROOT}/etc/profile.d"
-        install -m 0644 /usr/lib/systemd/pod-enter.sh "${STAGE1_ROOT}/etc/profile.d/pod-enter.sh"
-    fi
-
     printf '%s\n' "${POD_HOSTNAME}" > "${STAGE1_ROOT}/etc/hostname"
     printf '%s\n' "${POD_MACHINE_ID}" > "${STAGE1_ROOT}/etc/machine-id"
 
@@ -646,15 +627,13 @@ cmd_start() {
         dropin_dir="${UNIT_DIR}/${app_id}.service.d"
         mkdir -p "${dropin_dir}"
 
-        # Layer 10: Stage 2 image defaults from user.pod.unit xattr (or legacy /etc/pod.service)
+        # Layer 10: Stage 2 image defaults exclusively from user.pod.unit xattr
         if has_xattr user.pod.unit "${img_dir}"; then
             read_xattr user.pod.unit "${img_dir}" > "${dropin_dir}/10-image.conf"
-        elif [ -f "${img_dir}/etc/pod.service" ]; then
-            cp "${img_dir}/etc/pod.service" "${dropin_dir}/10-image.conf"
         fi
 
-        # Materialise user.pod.env xattr inside Stage 1 (or fall back to legacy Stage 2 /etc/pod-environment)
-        env_file_directive="EnvironmentFile=-${app_target}/etc/pod-environment"
+        # Materialise user.pod.env xattr inside Stage 1 when present
+        env_file_directive=""
         if has_xattr user.pod.env "${img_dir}"; then
             read_xattr user.pod.env "${img_dir}" > "${UNIT_DIR}/${app_id}.env"
             chmod 0644 "${UNIT_DIR}/${app_id}.env"
@@ -718,7 +697,7 @@ cmd_start() {
             has_image_exec=1
         fi
         if [ "$has_exec_override" -eq 0 ] && [ "$has_image_exec" -eq 0 ]; then
-            echo "No ExecStart= in ${cred} and no user.pod.unit or /etc/pod.service with ExecStart= in ${img_dir}" >&2
+            echo "No ExecStart= in ${cred} and no user.pod.unit xattr with ExecStart= in ${img_dir}" >&2
             exit 1
         fi
 
@@ -744,7 +723,9 @@ ProtectHostname=yes
 EOF
             printf 'LogExtraFields=POD_UNIT=%s\n' "${MACHINE_NAME}"
             printf 'RootDirectory=%s\n' "${app_target}"
-            printf '%s\n' "${env_file_directive}"
+            if [ -n "${env_file_directive}" ]; then
+                printf '%s\n' "${env_file_directive}"
+            fi
         } > "${UNIT_DIR}/${app_id}.service"
 
         # Layer 20: Per-pod credential overrides from SetCredential=pod.app.<app_id>

@@ -84,18 +84,15 @@ if [ -n "$UNIT_FILE" ]; then
     cp "$UNIT_FILE" "$TMP_UNIT"
 elif [ -n "$EXEC_CMD" ]; then
     printf '[Service]\nExecStart=%s\n' "$EXEC_CMD" > "$TMP_UNIT"
-elif [ -f "${STAGE_ROOT}/etc/pod.service" ]; then
-    cp "${STAGE_ROOT}/etc/pod.service" "$TMP_UNIT"
+elif getfattr --absolute-names -n user.pod.unit "${STAGE_ROOT}" >/dev/null 2>&1; then
+    getfattr --absolute-names --only-values -n user.pod.unit "${STAGE_ROOT}" > "$TMP_UNIT"
 fi
 
 if [ -n "$ENV_FILE" ]; then
     cp "$ENV_FILE" "$TMP_ENV"
-elif [ -f "${STAGE_ROOT}/etc/pod-environment" ]; then
-    cp "${STAGE_ROOT}/etc/pod-environment" "$TMP_ENV"
+elif getfattr --absolute-names -n user.pod.env "${STAGE_ROOT}" >/dev/null 2>&1; then
+    getfattr --absolute-names --only-values -n user.pod.env "${STAGE_ROOT}" > "$TMP_ENV"
 fi
-
-# Strip legacy in-tree manifests from the staging rootfs so sealed rootfs trees stay clean
-rm -f "${STAGE_ROOT}/etc/pod.service" "${STAGE_ROOT}/etc/pod-environment"
 
 # Detect app log symlinks (excluding /dev, /proc, /sys) or service configs pointing at /dev/stdout|/dev/stderr
 # and prepend pod-stdio@%N.service without stripping original INI headers.
