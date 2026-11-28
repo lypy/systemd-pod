@@ -4,7 +4,7 @@ set -eu
 CRED_DIR="${CREDENTIALS_DIRECTORY:-/run/credentials}"
 
 usage() {
-    echo "Usage: $0 {start|stop}" >&2
+    echo "Usage: $0 {start|stop|inspect <image>}" >&2
     exit 1
 }
 
@@ -816,8 +816,59 @@ EOF
         $NSPAWN_JOURNAL_BINDS
 }
 
+cmd_inspect() {
+    if [ "$#" -ne 1 ] || [ -z "${1:-}" ]; then
+        echo "Usage: $0 inspect <image-name-or-path>" >&2
+        exit 1
+    fi
+    ref="$1"
+    case "$ref" in
+        /*) target="$ref" ;;
+        *)  target="/var/lib/machines/${ref}" ;;
+    esac
+    if [ ! -e "$target" ]; then
+        echo "Image not found: ${target}" >&2
+        exit 1
+    fi
+    resolved="$(readlink -f "$target")"
+    if [ ! -d "$resolved" ]; then
+        echo "Image path is not a directory: ${resolved}" >&2
+        exit 1
+    fi
+
+    ver="$(getfattr --absolute-names --only-values -n user.pod.version "$resolved" 2>/dev/null || printf '(unset)')"
+    origin="$(getfattr --absolute-names --only-values -n user.xdg.origin.url "$resolved" 2>/dev/null || printf '(unset)')"
+    escaped="$(printf '%s' "$resolved" | sed 's/[.[\*^$()+?{|]/\\&/g')"
+    if grep -qE "(^|,)lowerdir=([^ ,]*:)?${escaped}(:|,| |$)" /proc/[0-9]*/mountinfo 2>/dev/null; then
+        pinned="yes"
+    else
+        pinned="no"
+    fi
+
+    printf 'Image:   %s\n' "${target##*/}"
+    printf 'Path:    %s\n' "${resolved}"
+    printf 'Version: %s\n' "${ver}"
+    printf 'Origin:  %s\n' "${origin}"
+    printf 'Pinned:  %s\n' "${pinned}"
+
+    printf '\n--- user.pod.unit ---\n'
+    if getfattr --absolute-names -n user.pod.unit "$resolved" >/dev/null 2>&1; then
+        getfattr --absolute-names --only-values -n user.pod.unit "$resolved" | awk '1'
+    else
+        printf '(none)\n'
+    fi
+
+    printf '\n--- user.pod.env ---\n'
+    if getfattr --absolute-names -n user.pod.env "$resolved" >/dev/null 2>&1; then
+        getfattr --absolute-names --only-values -n user.pod.env "$resolved" | awk '1'
+    else
+        printf '(none)\n'
+    fi
+}
+
 case "${1:-}" in
-    start) cmd_start ;;
-    stop)  cmd_stop ;;
-    *)     usage ;;
+    start)   cmd_start ;;
+    stop)    cmd_stop ;;
+    inspect) shift; cmd_inspect "$@" ;;
+    *)       usage ;;
 esac

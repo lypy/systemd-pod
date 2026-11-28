@@ -2,20 +2,31 @@
 set -eu
 
 usage() {
-    echo "Usage: $0 [--dry-run] [--status]" >&2
+    echo "Usage: $0 [--dry-run] [--status] [--inspect <image>]" >&2
     exit 1
 }
 
 DRY_RUN=0
 STATUS_ONLY=0
+INSPECT_IMG=""
 
-for arg in "$@"; do
-    case "$arg" in
-        --dry-run) DRY_RUN=1 ;;
-        --status)  STATUS_ONLY=1 ;;
-        *)         usage ;;
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --dry-run)   DRY_RUN=1; shift ;;
+        --status)    STATUS_ONLY=1; shift ;;
+        --inspect=*) INSPECT_IMG="${1#*=}"; shift ;;
+        --inspect)
+            [ "$#" -ge 2 ] || usage
+            INSPECT_IMG="$2"
+            shift 2
+            ;;
+        *)           usage ;;
     esac
 done
+
+if [ -n "$INSPECT_IMG" ]; then
+    exec "$(dirname "$0")/pod-runtime" inspect "$INSPECT_IMG"
+fi
 
 MACHINES_DIR="/var/lib/machines"
 STORE_BASE="${MACHINES_DIR}/.store"
