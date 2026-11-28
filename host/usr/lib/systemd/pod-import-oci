@@ -60,6 +60,17 @@ while [ "$n" -gt 0 ]; do
 done
 
 TARGET_DIR="/var/lib/machines/${IMG_NAME}"
+
+check_lowerdir_not_in_use() {
+    escaped_target="$(printf '%s' "${TARGET_DIR}" | sed 's/[.[\*^$()+?{|]/\\&/g')"
+    if grep -qE "(^|,)lowerdir=([^ ,]*:)?${escaped_target}(:|,| |$)" /proc/[0-9]*/mountinfo 2>/dev/null; then
+        echo "Refusing to overwrite ${TARGET_DIR}: in use as an active OverlayFS lowerdir (use a new image version or stop pods using it first)" >&2
+        exit 1
+    fi
+}
+
+check_lowerdir_not_in_use
+
 mkdir -p /var/lib/machines
 TMP_DIR="$(mktemp -d "/var/lib/machines/.import-${IMG_NAME}.XXXXXX")"
 
@@ -188,6 +199,7 @@ fi
 
 # 6. Atomically install into /var/lib/machines/<image> and mark read-only
 chmod 0755 "${ROOTFS}"
+check_lowerdir_not_in_use
 if [ -e "${TARGET_DIR}" ]; then
     machinectl read-only "${IMG_NAME}" no 2>/dev/null || true
     mv "${TARGET_DIR}" "${TMP_DIR}/old"
