@@ -1,0 +1,245 @@
+#!/bin/sh
+set -eu
+
+# Usage: pod-image-seal <staging-rootfs-dir> <image-name> [options]
+# Options:
+#   --unit-file=<path>   Path to [Unit]/[Service] drop-in file
+#   --env-file=<path>    Path to EnvironmentFile file
+#   --exec=<cmd>         Shorthand to generate a [Service] ExecStart= line
+#   --version=<ver>      Explicit version or digest (default: UTC timestamp)
+#   --origin=<url>       Source reference stored in user.xdg.origin.url
+
+usage() {
+    echo "Usage: $0 <staging-rootfs-dir> <image-name> [--unit-file=...] [--env-file=...] [--exec=...] [--version=...] [--origin=...]" >&2
+    exit 1
+}
+
+if [ "$#" -lt 2 ]; then
+    usage
+fi
+
+STAGE_ROOT="$1"
+IMG_NAME="$2"
+shift 2
+
+if [ ! -d "$STAGE_ROOT" ]; then
+    echo "Staging directory does not exist: ${STAGE_ROOT}" >&2
+    exit 1
+fi
+
+case "$IMG_NAME" in
+    ""|.*|*/*|*..*|*[[:space:]]*)
+        echo "Invalid image name: ${IMG_NAME}" >&2
+        exit 1
+        ;;
+esac
+
+UNIT_FILE=""
+ENV_FILE=""
+EXEC_CMD=""
+VERSION_TAG=""
+ORIGIN_URL=""
+
+for arg in "$@"; do
+    case "$arg" in
+        --unit-file=*) UNIT_FILE="${arg#*=}" ;;
+        --env-file=*)  ENV_FILE="${arg#*=}" ;;
+        --exec=*)      EXEC_CMD="${arg#*=}" ;;
+        --version=*)   VERSION_TAG="${arg#*=}" ;;
+        --origin=*)    ORIGIN_URL="${arg#*=}" ;;
+        *)             echo "Unknown option: ${arg}" >&2; usage ;;
+    esac
+done
+
+for cmd in setfattr getfattr base64 chattr; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+        echo "Missing required tool: ${cmd}" >&2
+        exit 1
+    fi
+done
+
+if [ -z "$VERSION_TAG" ]; then
+    VERSION_TAG="$(date -u +%Y%m%d%H%M%S)"
+fi
+
+case "$VERSION_TAG" in
+    ""|.*|*/*|*..*|*[[:space:]]*)
+        echo "Invalid version tag: ${VERSION_TAG}" >&2
+        exit 1
+        ;;
+esac
+
+MACHINES_DIR="/var/lib/machines"
+STORE_BASE="${MACHINES_DIR}/.store"
+mkdir -p -m 0755 "${MACHINES_DIR}" "${STORE_BASE}"
+
+TMP_UNIT="$(mktemp "${STORE_BASE}/.unit-${IMG_NAME}.XXXXXX")"
+TMP_ENV="$(mktemp "${STORE_BASE}/.env-${IMG_NAME}.XXXXXX")"
+cleanup() {
+    rm -f "${TMP_UNIT}" "${TMP_UNIT}.orig" "${TMP_ENV}"
+}
+trap cleanup EXIT INT TERM
+
+if [ -n "$UNIT_FILE" ]; then
+    cp "$UNIT_FILE" "$TMP_UNIT"
+elif [ -n "$EXEC_CMD" ]; then
+    printf '[Service]\nExecStart=%s\n' "$EXEC_CMD" > "$TMP_UNIT"
+elif [ -f "${STAGE_ROOT}/etc/pod.service" ]; then
+    cp "${STAGE_ROOT}/etc/pod.service" "$TMP_UNIT"
+fi
+
+if [ -n "$ENV_FILE" ]; then
+    cp "$ENV_FILE" "$TMP_ENV"
+elif [ -f "${STAGE_ROOT}/etc/pod-environment" ]; then
+    cp "${STAGE_ROOT}/etc/pod-environment" "$TMP_ENV"
+fi
+
+# Strip legacy in-tree manifests from the staging rootfs so sealed rootfs trees stay clean
+rm -f "${STAGE_ROOT}/etc/pod.service" "${STAGE_ROOT}/etc/pod-environment"
+
+# Detect app log symlinks (excluding /dev, /proc, /sys) or service configs pointing at /dev/stdout|/dev/stderr
+# and prepend pod-stdio@%N.service without stripping original INI headers.
+if [ -s "$TMP_UNIT" ]; then
+    if ! grep -q 'pod-stdio@' "$TMP_UNIT"; then
+        needs_fifo=0
+        if find "${STAGE_ROOT}" \( -path "${STAGE_ROOT}/dev" -o -path "${STAGE_ROOT}/proc" -o -path "${STAGE_ROOT}/sys" \) -prune -o -type l -exec readlink {} + 2>/dev/null | grep -Eq '^(/dev/(stdout|stderr|fd/[12])|/proc/(self|1)/fd/[12])$'; then
+            needs_fifo=1
+        elif grep -RIlqE --exclude-dir='init.d' --exclude-dir='rc*.d' '(/dev/(stdout|stderr)|/proc/(self|1)/fd/[12])' "${STAGE_ROOT}/etc" "${STAGE_ROOT}/usr/local/etc" 2>/dev/null; then
+            needs_fifo=1
+        fi
+        if [ "$needs_fifo" -eq 1 ]; then
+            mv "$TMP_UNIT" "${TMP_UNIT}.orig"
+            {
+                printf '[Unit]\nWants=pod-stdio@%%N.service\nAfter=pod-stdio@%%N.service\n\n'
+                printf '[Service]\nStandardOutput=file:/run/pod-stdio/%%N.fifo\nStandardError=file:/run/pod-stdio/%%N.fifo\n\n'
+                cat "${TMP_UNIT}.orig"
+            } > "$TMP_UNIT"
+            rm -f "${TMP_UNIT}.orig"
+        fi
+    fi
+fi
+
+# Check ext4 single-block xattr limit (4 KiB without ea_inode) before modifying the store
+check_xattr_budget() {
+    fs_type="$(stat -f -c '%T' "${STORE_BASE}" 2>/dev/null || true)"
+    case "$fs_type" in
+        ext2/ext3|ext4) ;;
+        *) return 0 ;;
+    esac
+
+    # If tune2fs confirms ea_inode is enabled, ext4 supports large xattrs
+    dev_src="$(findmnt -no SOURCE -T "${STORE_BASE}" 2>/dev/null || true)"
+    if [ -n "$dev_src" ] && command -v tune2fs >/dev/null 2>&1; then
+        if tune2fs -l "$dev_src" 2>/dev/null | grep -q 'Filesystem features:.*ea_inode'; then
+            return 0
+        fi
+    fi
+
+    total_bytes=64
+    ver_len="$(printf '%s' "${VERSION_TAG}" | wc -c)"
+    total_bytes=$((total_bytes + 32 + 16 + ver_len))
+    if [ -s "$TMP_UNIT" ]; then
+        unit_len="$(wc -c < "$TMP_UNIT")"
+        total_bytes=$((total_bytes + 32 + 13 + unit_len))
+    fi
+    if [ -s "$TMP_ENV" ]; then
+        env_len="$(wc -c < "$TMP_ENV")"
+        total_bytes=$((total_bytes + 32 + 12 + env_len))
+    fi
+    if [ -n "$ORIGIN_URL" ]; then
+        orig_len="$(printf '%s' "${ORIGIN_URL}" | wc -c)"
+        total_bytes=$((total_bytes + 32 + 19 + orig_len))
+    fi
+
+    if [ "$total_bytes" -gt 3800 ]; then
+        echo "Extended attribute metadata (~${total_bytes} bytes) exceeds safe 4 KiB ext4 xattr block budget on ${STORE_BASE}; move bulky EnvironmentFile data to a host bind mount or enable ea_inode" >&2
+        exit 1
+    fi
+}
+
+check_xattr_budget
+
+is_active_lowerdir() {
+    check_path="$1"
+    escaped="$(printf '%s' "${check_path}" | sed 's/[.[\*^$()+?{|]/\\&/g')"
+    grep -qE "(^|,)lowerdir=([^ ,]*:)?${escaped}(:|,| |$)" /proc/[0-9]*/mountinfo 2>/dev/null
+}
+
+STORE_REL=".store/${IMG_NAME}_${VERSION_TAG}"
+STORE_DIR="${MACHINES_DIR}/${STORE_REL}"
+LINK_PATH="${MACHINES_DIR}/${IMG_NAME}"
+
+flip_symlink() {
+    # Handle one-time migration when LINK_PATH is still a legacy directory rather than a symlink
+    if [ -d "${LINK_PATH}" ] && [ ! -L "${LINK_PATH}" ]; then
+        if is_active_lowerdir "${LINK_PATH}"; then
+            echo "Refusing to replace legacy directory ${LINK_PATH}: in use as an active OverlayFS lowerdir (stop pods using it first)" >&2
+            exit 1
+        fi
+        chattr -i "${LINK_PATH}" 2>/dev/null || true
+        legacy_old="${STORE_BASE}/.migrated-${IMG_NAME}.$$"
+        mv "${LINK_PATH}" "${legacy_old}"
+        ln -sfn "${STORE_REL}" "${LINK_PATH}.tmp.$$"
+        mv -Tf "${LINK_PATH}.tmp.$$" "${LINK_PATH}"
+        rm -rf "${legacy_old}"
+    else
+        ln -sfn "${STORE_REL}" "${LINK_PATH}.tmp.$$"
+        mv -Tf "${LINK_PATH}.tmp.$$" "${LINK_PATH}"
+    fi
+}
+
+if [ -d "${STORE_DIR}" ]; then
+    if is_active_lowerdir "${STORE_DIR}"; then
+        # Allow idempotent symlink flip if metadata matches the already-sealed live version
+        same_meta=1
+        cur_unit="$(getfattr --absolute-names --only-values -n user.pod.unit "${STORE_DIR}" 2>/dev/null || true)"
+        new_unit="$(cat "$TMP_UNIT")"
+        cur_env="$(getfattr --absolute-names --only-values -n user.pod.env "${STORE_DIR}" 2>/dev/null || true)"
+        new_env="$(cat "$TMP_ENV")"
+        if [ "$cur_unit" != "$new_unit" ] || [ "$cur_env" != "$new_env" ]; then
+            same_meta=0
+        fi
+        if [ "$same_meta" -eq 1 ]; then
+            rm -rf "${STAGE_ROOT}"
+            flip_symlink
+            echo "Already sealed ${IMG_NAME} -> ${STORE_DIR} (in use); updated symlink"
+            exit 0
+        fi
+        echo "Refusing to overwrite ${STORE_DIR}: in use as an active OverlayFS lowerdir (use a new --version= or stop pods using it first)" >&2
+        exit 1
+    fi
+    chattr -i "${STORE_DIR}" 2>/dev/null || true
+    rm -rf "${STORE_DIR}"
+fi
+
+chmod 0755 "${STAGE_ROOT}"
+src_dev="$(stat -c '%d' "${STAGE_ROOT}")"
+dst_dev="$(stat -c '%d' "${STORE_BASE}")"
+if [ "$src_dev" = "$dst_dev" ]; then
+    mv "${STAGE_ROOT}" "${STORE_DIR}"
+else
+    mkdir -p -m 0755 "${STORE_DIR}"
+    cp -a "${STAGE_ROOT}/." "${STORE_DIR}/"
+    rm -rf "${STAGE_ROOT}"
+fi
+
+# Write extended attributes using 0s base64 encoding to prevent backslash unquoting
+setfattr -n user.pod.version -v "0s$(printf '%s' "${VERSION_TAG}" | base64 -w 0)" "${STORE_DIR}"
+
+if [ -s "$TMP_UNIT" ]; then
+    setfattr -n user.pod.unit -v "0s$(base64 -w 0 < "$TMP_UNIT")" "${STORE_DIR}"
+fi
+
+if [ -s "$TMP_ENV" ]; then
+    setfattr -n user.pod.env -v "0s$(base64 -w 0 < "$TMP_ENV")" "${STORE_DIR}"
+fi
+
+if [ -n "$ORIGIN_URL" ]; then
+    setfattr -n user.xdg.origin.url -v "0s$(printf '%s' "${ORIGIN_URL}" | base64 -w 0)" "${STORE_DIR}"
+fi
+
+# Lock the versioned directory read-only and atomically flip the active symlink
+chattr +i "${STORE_DIR}"
+flip_symlink
+
+echo "Sealed ${IMG_NAME} -> ${STORE_DIR}"

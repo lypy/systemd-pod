@@ -1,0 +1,83 @@
+#!/bin/sh
+set -eu
+
+usage() {
+    echo "Usage: $0 [--dry-run] [--status]" >&2
+    exit 1
+}
+
+DRY_RUN=0
+STATUS_ONLY=0
+
+for arg in "$@"; do
+    case "$arg" in
+        --dry-run) DRY_RUN=1 ;;
+        --status)  STATUS_ONLY=1 ;;
+        *)         usage ;;
+    esac
+done
+
+MACHINES_DIR="/var/lib/machines"
+STORE_BASE="${MACHINES_DIR}/.store"
+
+if [ ! -d "${STORE_BASE}" ]; then
+    echo "No image store present at ${STORE_BASE}"
+    exit 0
+fi
+
+# Collect active symlink targets
+ACTIVE_TARGETS=""
+for entry in "${MACHINES_DIR}"/*; do
+    [ -e "$entry" ] || [ -L "$entry" ] || continue
+    if [ -L "$entry" ]; then
+        resolved="$(readlink -f "$entry" 2>/dev/null || true)"
+        if [ -n "$resolved" ]; then
+            ACTIVE_TARGETS="${ACTIVE_TARGETS}
+${resolved}"
+        fi
+    elif [ "$STATUS_ONLY" -eq 1 ] && [ -d "$entry" ]; then
+        printf 'LEGACY  %s\n' "$entry"
+    fi
+done
+
+is_active_target() {
+    printf '%s\n' "${ACTIVE_TARGETS}" | grep -Fxq "$1"
+}
+
+is_pinned_lowerdir() {
+    escaped="$(printf '%s' "$1" | sed 's/[.[\*^$()+?{|]/\\&/g')"
+    grep -qE "(^|,)lowerdir=([^ ,]*:)?${escaped}(:|,| |$)" /proc/[0-9]*/mountinfo 2>/dev/null
+}
+
+removed=0
+for store_dir in "${STORE_BASE}"/*; do
+    [ -d "$store_dir" ] || continue
+    if is_active_target "$store_dir"; then
+        if [ "$STATUS_ONLY" -eq 1 ]; then
+            ver="$(getfattr --absolute-names --only-values -n user.pod.version "$store_dir" 2>/dev/null || printf '-')"
+            printf 'ACTIVE  %s (version=%s)\n' "${store_dir##*/}" "$ver"
+        fi
+        continue
+    fi
+    if is_pinned_lowerdir "$store_dir"; then
+        ver="$(getfattr --absolute-names --only-values -n user.pod.version "$store_dir" 2>/dev/null || printf '-')"
+        printf 'PINNED  %s (version=%s; still mounted by a running pod)\n' "${store_dir##*/}" "$ver"
+        continue
+    fi
+    if [ "$STATUS_ONLY" -eq 1 ]; then
+        printf 'UNUSED  %s\n' "${store_dir##*/}"
+        continue
+    fi
+    if [ "$DRY_RUN" -eq 1 ]; then
+        printf 'WOULD REMOVE  %s\n' "$store_dir"
+    else
+        chattr -i "$store_dir" 2>/dev/null || true
+        rm -rf "$store_dir"
+        printf 'REMOVED  %s\n' "$store_dir"
+        removed=$((removed + 1))
+    fi
+done
+
+if [ "$STATUS_ONLY" -eq 0 ] && [ "$DRY_RUN" -eq 0 ]; then
+    echo "GC complete: removed ${removed} unused image version(s)."
+fi

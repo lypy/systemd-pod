@@ -6,10 +6,10 @@ A shared read-only stage 1 image (`/var/lib/machines/stage1-debian`) provides th
 
 Networking setup, container construction, and OCI image import are split into modular host scripts while leaving process supervision, dependency ordering, and namespace management to systemd. `SetCredential=` (introduced in systemd 247) passes declarative parameters from the unit file to the host scripts:
 
-1. `host/usr/lib/systemd/pod-net-host-start` configures a pod to share the host network namespace and delegates container setup to `pod-container-start`.
-2. `host/usr/lib/systemd/pod-net-vlan-start` configures an isolated network namespace (`PrivateNetwork=yes`), attaches VLAN or virtual interfaces from `SetCredential=net.if.*`, and delegates container setup to `pod-container-start`.
-3. `host/usr/lib/systemd/pod-container-start` derives the machine name from the systemd unit name, sets the stage 1 hostname to `INVOCATION_ID` (unless `SetCredential=pod.hostname:` is specified), derives a deterministic `/etc/machine-id` per host and unit for persistent journaling across restarts, mounts the per-pod stage 1 overlay, shared `/vol/*` directories, stage 2 application overlays, declarative host bind mounts, and container journal directories, mirrors stage 2 `User=`, `Group=`, and `SupplementaryGroups=` identities into the ephemeral stage 1 `/etc/passwd` and `/etc/group` (adding `CAP_SETUID` and `CAP_SETGID` when needed), emits native stage 2 `.service` units and drop-ins under `${STAGE1_ROOT}/etc/systemd/system/`, and executes `systemd-nspawn --notify-ready=yes`.
-4. `host/usr/lib/systemd/pod-import-oci` imports unmodified Docker and OCI images from container registries or local archives into `/var/lib/machines/<image>` using `skopeo`, `umoci`, and `jq`, generating `/etc/pod.service` and `/etc/pod-environment`.
+1. `host/usr/lib/systemd/pod-runtime` (`start` and `stop`) unifies host-networked and private-namespace networking (`PrivateNetwork=yes` with `net.if.*` VLAN/veth/macvlan/ipvlan interfaces and 802.1Q teardown retry), resolves versioned Stage 1 and Stage 2 symlinks via `readlink -f`, materialises `user.pod.unit` and `user.pod.env` extended attributes into Stage 1 unit drop-ins and `/etc/systemd/system/<app>.env`, isolates Stage 2 rootless identities via numeric `pod-uid-<uid>`/`pod-gid-<gid>` entries, registers UID 0 `<app>@<pod>` and `stage1@<pod>` shell aliases, unregisters stale `systemd-machined` records via `UnregisterMachine`, and executes `systemd-nspawn --notify-ready=yes`.
+2. `host/usr/lib/systemd/pod-image-seal` seals OCI and non-OCI rootfs trees into immutable `/var/lib/machines/.store/<image>_<version>` directories (`chattr +i`), writes `user.pod.unit`, `user.pod.env`, `user.pod.version`, and `user.xdg.origin.url` extended attributes (using `0s` base64 encoding and an `ext4` 4 KiB budget check), and atomically flips `/var/lib/machines/<image>`.
+3. `host/usr/lib/systemd/pod-import-oci` imports unmodified Docker and OCI images using `skopeo`, `umoci`, and `jq`, generates unit and environment metadata outside the rootfs, and seals them via `pod-image-seal`.
+4. `host/usr/lib/systemd/pod-image-gc` (`--status`, `--dry-run`) reports active, pinned, and unused `.store/` image versions and safely reclaims unreferenced versions.
 5. `stage1/etc/systemd/system/pod-stage2-post@.service` and `stage1/usr/lib/systemd/pod-stage2-post` run inside stage 1 after each stage 2 service starts or restarts, stamping each stage 2 private UTS namespace and `/etc/hostname` with its own `InvocationID` and synchronising `/etc/os-release` under `flock` before `pod-idle.target` signals readiness to the host.
 6. `stage1/etc/systemd/system/pod-stdio@.service` provides a per-application FIFO bridge to `systemd-journald` so OCI applications that call `open("/dev/stdout")` or `open("/dev/stderr")` (such as `nginx` or `httpd`) do not encounter `ENXIO` on a `journald` stream socket while still streaming all output to the pod journal with `POD_UNIT=` metadata.
 
@@ -24,12 +24,10 @@ Networking setup, container construction, and OCI image import are split into mo
 │   └── usr
 │       └── lib
 │           └── systemd
-│               ├── pod-container-start
+│               ├── pod-image-gc
+│               ├── pod-image-seal
 │               ├── pod-import-oci
-│               ├── pod-net-host-start
-│               ├── pod-net-start
-│               ├── pod-net-stop
-│               └── pod-net-vlan-start
+│               └── pod-runtime
 └── stage1
     ├── etc
     │   ├── profile.d
@@ -142,21 +140,17 @@ sudo machinectl read-only stage1-debian yes
 
 Install the six host scripts from [`host/usr/lib/systemd/`](host/usr/lib/systemd/) into `/usr/lib/systemd/`:
 
-* [`host/usr/lib/systemd/pod-container-start`](host/usr/lib/systemd/pod-container-start)
+* [`host/usr/lib/systemd/pod-runtime`](host/usr/lib/systemd/pod-runtime)
+* [`host/usr/lib/systemd/pod-image-seal`](host/usr/lib/systemd/pod-image-seal)
 * [`host/usr/lib/systemd/pod-import-oci`](host/usr/lib/systemd/pod-import-oci)
-* [`host/usr/lib/systemd/pod-net-host-start`](host/usr/lib/systemd/pod-net-host-start)
-* [`host/usr/lib/systemd/pod-net-vlan-start`](host/usr/lib/systemd/pod-net-vlan-start)
-* [`host/usr/lib/systemd/pod-net-start`](host/usr/lib/systemd/pod-net-start)
-* [`host/usr/lib/systemd/pod-net-stop`](host/usr/lib/systemd/pod-net-stop)
+* [`host/usr/lib/systemd/pod-image-gc`](host/usr/lib/systemd/pod-image-gc)
 
 ```sh
 sudo install -m 0755 \
-  host/usr/lib/systemd/pod-container-start \
+  host/usr/lib/systemd/pod-runtime \
+  host/usr/lib/systemd/pod-image-seal \
   host/usr/lib/systemd/pod-import-oci \
-  host/usr/lib/systemd/pod-net-host-start \
-  host/usr/lib/systemd/pod-net-vlan-start \
-  host/usr/lib/systemd/pod-net-start \
-  host/usr/lib/systemd/pod-net-stop \
+  host/usr/lib/systemd/pod-image-gc \
   /usr/lib/systemd/
 ```
 
@@ -229,8 +223,8 @@ sudo systemd-run --collect \
   --property="SetCredential=vol.run:mode=0775,uid=0,gid=0" \
   --property="SetCredential=pod.app.redis:image=redis-alpine,BindPaths=/vol/run:/run/redis,MemoryMax=128M" \
   --property="SetCredential=pod.app.nginx:image=nginx-alpine,After=redis.service,BindPaths=/vol/run:/run/redis,MemoryMax=128M" \
-  --property="ExecStopPost=-/usr/lib/systemd/pod-net-stop" \
-  /usr/lib/systemd/pod-net-start
+  --property="ExecStopPost=-/usr/lib/systemd/pod-runtime stop" \
+  /usr/lib/systemd/pod-runtime start
 ```
 
 To override the command of an imported OCI image for one pod while preserving its `WorkingDirectory=`, `User=`, `KillSignal=`, and `/etc/pod-environment` defaults, pass `ExecStart=` in the credential:
@@ -255,8 +249,8 @@ sudo systemd-run --collect \
   --property="RuntimeDirectory=pods/%N" \
   --property="SetCredential=pod.stage1:stage1-debian" \
   --property="SetCredential=pod.app.ping:image=test-ping,ExecStart=/bin/ping 127.0.0.1" \
-  --property="ExecStopPost=-/usr/lib/systemd/pod-net-stop" \
-  /usr/lib/systemd/pod-net-host-start
+  --property="ExecStopPost=-/usr/lib/systemd/pod-runtime stop" \
+  /usr/lib/systemd/pod-runtime start
 ```
 
 ---
@@ -277,8 +271,8 @@ sudo systemd-run --collect \
   --property="SetCredential=net.dns:1.1.1.1,8.8.8.8" \
   --property="SetCredential=net.if.vlan100:ifname=eth0,master=enp1s0,kind=vlan,vlan_id=100,addr=192.0.2.10/24,gw=192.0.2.1" \
   --property="SetCredential=pod.app.ping:image=test-ping,ExecStart=/bin/ping 192.0.2.1" \
-  --property="ExecStopPost=-/usr/lib/systemd/pod-net-stop" \
-  /usr/lib/systemd/pod-net-vlan-start
+  --property="ExecStopPost=-/usr/lib/systemd/pod-runtime stop" \
+  /usr/lib/systemd/pod-runtime start
 ```
 
 ---
@@ -312,8 +306,8 @@ SetCredential=host.bind.conf:src=/etc/quagga,dst=/vol/conf,ro=true
 SetCredential=pod.app.zebra:image=zebra-riscv64,ExecStart=/usr/lib/quagga/zebra -A 127.0.0.1,BindPaths=/vol/run:/run/quagga,BindReadOnlyPaths=/vol/conf:/etc/quagga,CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_ADMIN CAP_SETUID CAP_SETGID CAP_CHOWN CAP_DAC_OVERRIDE,MemoryMax=256M,TasksMax=64
 SetCredential=pod.app.bgpd:image=bgpd-riscv64,After=zebra.service,ExecStart=/usr/lib/quagga/bgpd -A 127.0.0.1,BindPaths=/vol/run:/run/quagga,BindReadOnlyPaths=/vol/conf:/etc/quagga,CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE CAP_NET_BROADCAST CAP_SYS_ADMIN CAP_SETUID CAP_SETGID CAP_CHOWN CAP_DAC_OVERRIDE,MemoryMax=256M,TasksMax=64
 
-ExecStart=/usr/lib/systemd/pod-net-start
-ExecStopPost=-/usr/lib/systemd/pod-net-stop
+ExecStart=/usr/lib/systemd/pod-runtime start
+ExecStopPost=-/usr/lib/systemd/pod-runtime stop
 
 [Install]
 WantedBy=multi-user.target

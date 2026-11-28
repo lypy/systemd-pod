@@ -1,0 +1,842 @@
+#!/bin/sh
+set -eu
+
+CRED_DIR="${CREDENTIALS_DIRECTORY:-/run/credentials}"
+
+usage() {
+    echo "Usage: $0 {start|stop}" >&2
+    exit 1
+}
+
+read_kv() {
+    target_key="$1"
+    kv_string="$2"
+    old_ifs="$IFS"
+    set -f
+    IFS=','
+    for pair in $kv_string; do
+        k="${pair%%=*}"
+        v="${pair#*=}"
+        if [ "$k" = "$target_key" ]; then
+            IFS="$old_ifs"
+            set +f
+            printf '%s' "$v"
+            return 0
+        fi
+    done
+    IFS="$old_ifs"
+    set +f
+    return 1
+}
+
+derive_machine_name() {
+    u_prefix=""
+    if [ -r /proc/self/cgroup ]; then
+        u_prefix="$(sed -n 's|.*/\([^/]*\)\.service\(/.*\)\{0,1\}$|\1|p' /proc/self/cgroup | head -n 1)"
+    fi
+    if [ -z "$u_prefix" ] && [ -n "${RUNTIME_DIRECTORY:-}" ]; then
+        u_prefix="${RUNTIME_DIRECTORY##*/}"
+    fi
+    m_name="$(printf '%s' "${u_prefix}" | tr -c 'A-Za-z0-9.-' '-' | sed 's/^[.-]*//; s/[.-]*$//' | cut -c1-64 | sed 's/[.-]*$//')"
+    if [ -z "$m_name" ]; then
+        m_name="pod-${INVOCATION_ID:-$(systemd-id128 new)}"
+    fi
+    printf '%s' "$m_name"
+}
+
+unregister_stale_machine() {
+    m_name="$1"
+    [ -n "$m_name" ] || return 0
+    if command -v busctl >/dev/null 2>&1; then
+        busctl call --quiet \
+            org.freedesktop.machine1 \
+            /org/freedesktop/machine1 \
+            org.freedesktop.machine1.Manager \
+            UnregisterMachine s "$m_name" 2>/dev/null || true
+    fi
+}
+
+has_xattr() {
+    attr_name="$1"
+    attr_path="$2"
+    command -v getfattr >/dev/null 2>&1 && \
+        getfattr --absolute-names -n "$attr_name" "$attr_path" >/dev/null 2>&1
+}
+
+read_xattr() {
+    attr_name="$1"
+    attr_path="$2"
+    getfattr --absolute-names --only-values -n "$attr_name" "$attr_path" 2>/dev/null
+}
+
+setup_network() {
+    self_netns="$(readlink /proc/self/ns/net)"
+    host_netns="$(readlink /proc/1/ns/net)"
+
+    if [ "$self_netns" = "$host_netns" ]; then
+        for cred in "${CRED_DIR}"/net.if.*; do
+            if [ -f "$cred" ]; then
+                echo "net.if.* credential (${cred##*/}) requires PrivateNetwork=yes on the pod service unit" >&2
+                exit 1
+            fi
+        done
+        return 0
+    fi
+
+    ip link set dev lo up
+
+    # Allow rootless Stage 2 apps in this network namespace to use ICMP echo sockets without CAP_NET_RAW
+    sysctl -q -w net.ipv4.ping_group_range="0 2147483647" 2>/dev/null || true
+
+    for cred in "${CRED_DIR}"/net.if.*; do
+        if [ ! -f "$cred" ]; then
+            continue
+        fi
+        spec="$(tr -d ' \t\r\n' < "$cred")"
+        ifname="$(read_kv ifname "$spec")"
+        master="$(read_kv master "$spec" || printf '')"
+        peer="$(read_kv peer "$spec" || printf '')"
+        kind="$(read_kv kind "$spec" || printf 'vlan')"
+        vlan_id="$(read_kv vlan_id "$spec" || printf '')"
+        addr="$(read_kv addr "$spec" || printf '')"
+        gw="$(read_kv gw "$spec" || printf '')"
+
+        if [ "$kind" = "vlan" ]; then
+            # Retry briefly in case the kernel cleanup_net() RCU workqueue is still
+            # releasing the previous pod network namespace's 802.1Q VLAN ID.
+            vlan_attempt=0
+            while ! nsenter --net=/proc/1/ns/net                 ip link add link "$master" netns "$$" name "$ifname" type vlan id "$vlan_id" 2>/tmp/.pod-vlan-err.$$; do
+                vlan_attempt=$((vlan_attempt + 1))
+                if [ "$vlan_attempt" -ge 15 ]; then
+                    cat /tmp/.pod-vlan-err.$$ >&2 || true
+                    rm -f /tmp/.pod-vlan-err.$$
+                    exit 1
+                fi
+                sleep 0.2
+            done
+            rm -f /tmp/.pod-vlan-err.$$
+        elif [ "$kind" = "veth" ]; then
+            if [ -z "$peer" ]; then
+                peer="$(printf 'v-%.8s-%s' "${INVOCATION_ID}" "${ifname}" | cut -c1-15)"
+            fi
+            nsenter --net=/proc/1/ns/net ip link del "$peer" 2>/dev/null || true
+            nsenter --net=/proc/1/ns/net \
+                ip link add name "$peer" type veth peer name "$ifname" netns "$$"
+            if [ -n "$master" ]; then
+                nsenter --net=/proc/1/ns/net \
+                    ip link set dev "$peer" master "$master"
+            fi
+            nsenter --net=/proc/1/ns/net \
+                ip link set dev "$peer" up
+        else
+            nsenter --net=/proc/1/ns/net \
+                ip link add link "$master" netns "$$" name "$ifname" type "$kind"
+        fi
+        ip link set dev "$ifname" up
+        if [ -n "$addr" ]; then
+            ip addr add "$addr" dev "$ifname"
+        fi
+        if [ -n "$gw" ]; then
+            ip route add default via "$gw" dev "$ifname"
+        fi
+    done
+}
+
+cmd_stop() {
+    m_name="$(derive_machine_name)"
+    unregister_stale_machine "$m_name"
+
+    if [ -n "${RUNTIME_DIRECTORY:-}" ]; then
+        for app_mnt in "${RUNTIME_DIRECTORY}"/app-rootfs/*; do
+            if [ -d "$app_mnt" ]; then
+                umount -l "$app_mnt" 2>/dev/null || true
+            fi
+        done
+        if [ -d "${RUNTIME_DIRECTORY}/stage1" ]; then
+            umount -l "${RUNTIME_DIRECTORY}/stage1" 2>/dev/null || true
+        fi
+    fi
+}
+
+cmd_start() {
+    # 1. Resolve unit-derived machine name, invocation hostname, and deterministic machine ID
+    INVOCATION_ID="${INVOCATION_ID:-$(systemd-id128 new)}"
+    export INVOCATION_ID
+
+    MACHINE_NAME="$(derive_machine_name)"
+
+    HOST_MACHINE_ID="$(tr -d ' \t\r\n' < /etc/machine-id)"
+    POD_MACHINE_ID="$(printf '%s:%s' "${HOST_MACHINE_ID}" "${MACHINE_NAME}" | sha256sum | cut -c1-32)"
+
+    POD_HOSTNAME=""
+    if [ -f "${CRED_DIR}/pod.hostname" ]; then
+        POD_HOSTNAME="$(tr -d ' \t\r\n' < "${CRED_DIR}/pod.hostname")"
+    fi
+    if [ -z "$POD_HOSTNAME" ]; then
+        POD_HOSTNAME="${INVOCATION_ID}"
+    fi
+
+    RUN_DIR="${RUNTIME_DIRECTORY:-/run/pods/${MACHINE_NAME}}"
+    mkdir -p -m 0755 "${RUN_DIR}"
+    printf '%s\n' "${MACHINE_NAME}" > "${RUN_DIR}/machine-name"
+    printf '%s\n' "${INVOCATION_ID}" > "${RUN_DIR}/invocation-id"
+
+    # 2. Configure private namespace networking (when PrivateNetwork=yes)
+    setup_network
+
+    # 3. Canonicalise Stage 1 image symlink and mount per-pod Stage 1 overlay
+    STAGE1_IMAGE="stage1-debian"
+    if [ -f "${CRED_DIR}/pod.stage1" ]; then
+        STAGE1_IMAGE="$(tr -d ' \t\r\n' < "${CRED_DIR}/pod.stage1")"
+    fi
+
+    STAGE1_LINK="/var/lib/machines/${STAGE1_IMAGE}"
+    if [ ! -d "${STAGE1_LINK}" ]; then
+        echo "Stage 1 image ${STAGE1_IMAGE} not found in /var/lib/machines" >&2
+        exit 1
+    fi
+    STAGE1_LOWER="$(readlink -f "${STAGE1_LINK}")"
+    if has_xattr user.pod.version "${STAGE1_LOWER}"; then
+        read_xattr user.pod.version "${STAGE1_LOWER}" > "${RUN_DIR}/stage1-version"
+        printf '\n' >> "${RUN_DIR}/stage1-version"
+    else
+        printf '%s\n' "${STAGE1_LOWER##*/}" > "${RUN_DIR}/stage1-version"
+    fi
+
+    STAGE1_ROOT="${RUN_DIR}/stage1"
+    mkdir -p "${STAGE1_ROOT}" "${RUN_DIR}/stage1-upper" "${RUN_DIR}/stage1-work"
+    mount -t overlay overlay \
+        -o "lowerdir=${STAGE1_LOWER},upperdir=${RUN_DIR}/stage1-upper,workdir=${RUN_DIR}/stage1-work" \
+        "${STAGE1_ROOT}"
+
+    # Prune unused Debian base-passwd stub accounts so app names such as list,
+    # proxy, mail, www-data, backup, and sync can be registered as UID 0 shell aliases.
+    awk -F: '$1 == "root" || $1 == "nobody" || $1 == "messagebus" || $1 ~ /^systemd-/' \
+        "${STAGE1_ROOT}/etc/passwd" > "${STAGE1_ROOT}/etc/passwd.tmp"
+    chmod 0644 "${STAGE1_ROOT}/etc/passwd.tmp"
+    mv -f "${STAGE1_ROOT}/etc/passwd.tmp" "${STAGE1_ROOT}/etc/passwd"
+
+    if [ -f "${STAGE1_ROOT}/etc/shadow" ]; then
+        awk -F: '$1 == "root" || $1 == "nobody" || $1 == "messagebus" || $1 ~ /^systemd-/' \
+            "${STAGE1_ROOT}/etc/shadow" > "${STAGE1_ROOT}/etc/shadow.tmp"
+        chmod 0640 "${STAGE1_ROOT}/etc/shadow.tmp"
+        mv -f "${STAGE1_ROOT}/etc/shadow.tmp" "${STAGE1_ROOT}/etc/shadow"
+    fi
+
+    if [ -f /usr/lib/systemd/pod-enter.sh ]; then
+        mkdir -p "${STAGE1_ROOT}/etc/profile.d"
+        install -m 0644 /usr/lib/systemd/pod-enter.sh "${STAGE1_ROOT}/etc/profile.d/pod-enter.sh"
+    fi
+
+    printf '%s\n' "${POD_HOSTNAME}" > "${STAGE1_ROOT}/etc/hostname"
+    printf '%s\n' "${POD_MACHINE_ID}" > "${STAGE1_ROOT}/etc/machine-id"
+
+    rm -f "${STAGE1_ROOT}/etc/resolv.conf"
+    if [ -f "${CRED_DIR}/net.dns" ]; then
+        dns_raw="$(tr -d ' \t\r\n' < "${CRED_DIR}/net.dns")"
+        : > "${STAGE1_ROOT}/etc/resolv.conf"
+        old_ifs="$IFS"
+        set -f
+        IFS=','
+        for srv in $dns_raw; do
+            printf 'nameserver %s\n' "$srv" >> "${STAGE1_ROOT}/etc/resolv.conf"
+        done
+        IFS="$old_ifs"
+        set +f
+    else
+        cp /etc/resolv.conf "${STAGE1_ROOT}/etc/resolv.conf"
+    fi
+    cp "${STAGE1_ROOT}/etc/resolv.conf" "${RUN_DIR}/resolv.conf"
+
+    # 4. Provision shared ephemeral empty volumes inside Stage 1 at /vol/<name>
+    mkdir -p -m 0755 "${RUN_DIR}/vol" "${STAGE1_ROOT}/vol"
+    for cred in "${CRED_DIR}"/vol.*; do
+        if [ ! -f "$cred" ]; then
+            continue
+        fi
+        vol_name="${cred##*vol.}"
+        spec="$(tr -d ' \t\r\n' < "$cred")"
+        mode="$(read_kv mode "$spec" || printf '0755')"
+        uid="$(read_kv uid "$spec" || printf '0')"
+        gid="$(read_kv gid "$spec" || printf '0')"
+        mkdir -p "${RUN_DIR}/vol/${vol_name}"
+        chmod "$mode" "${RUN_DIR}/vol/${vol_name}"
+        chown "${uid}:${gid}" "${RUN_DIR}/vol/${vol_name}"
+    done
+
+    # 5. Process declarative host bind mounts (host.bind.<name>:src=/path,dst=/path,ro=true)
+    NSPAWN_HOST_BINDS=""
+    for cred in "${CRED_DIR}"/host.bind.*; do
+        if [ ! -f "$cred" ]; then
+            continue
+        fi
+        spec="$(tr -d ' \t\r\n' < "$cred")"
+        src="$(read_kv src "$spec")"
+        dst="$(read_kv dst "$spec")"
+        ro="$(read_kv ro "$spec" || printf 'false')"
+        if [ -d "$src" ]; then
+            mkdir -p "${STAGE1_ROOT}${dst}"
+        else
+            mkdir -p "${STAGE1_ROOT}${dst%/*}"
+            touch "${STAGE1_ROOT}${dst}"
+        fi
+        if [ "$ro" = "true" ]; then
+            NSPAWN_HOST_BINDS="${NSPAWN_HOST_BINDS} --bind-ro=${src}:${dst}"
+        else
+            NSPAWN_HOST_BINDS="${NSPAWN_HOST_BINDS} --bind=${src}:${dst}"
+        fi
+    done
+
+    is_file_bind_src() {
+        bind_src="$1"
+        if [ -f "${STAGE1_ROOT}${bind_src}" ]; then
+            return 0
+        fi
+        if [ -d "${STAGE1_ROOT}${bind_src}" ]; then
+            return 1
+        fi
+        case "$bind_src" in
+            /vol/*)
+                vol_rel="${bind_src#/vol/}"
+                if [ -f "${RUN_DIR}/vol/${vol_rel}" ]; then
+                    return 0
+                fi
+                if [ -d "${RUN_DIR}/vol/${vol_rel}" ]; then
+                    return 1
+                fi
+                ;;
+        esac
+        if [ -f "$bind_src" ]; then
+            return 0
+        fi
+        return 1
+    }
+
+    prepare_bind_mountpoints() {
+        bind_list="$1"
+        bp_old_ifs="$IFS"
+        case "$-" in
+            *f*) bp_had_noglob=1 ;;
+            *)   bp_had_noglob=0; set -f ;;
+        esac
+        IFS=' '
+        for bind_entry in $bind_list; do
+            raw="${bind_entry#-}"
+            src="${raw%%:*}"
+            case "$raw" in
+                *:*)
+                    rest="${raw#*:}"
+                    dst="${rest%%:*}"
+                    ;;
+                *)
+                    dst="$src"
+                    ;;
+            esac
+            if [ -n "$dst" ]; then
+                if [ -f "${app_merged}${dst}" ] || is_file_bind_src "$src"; then
+                    mkdir -p "${app_merged}${dst%/*}"
+                    touch "${app_merged}${dst}"
+                else
+                    mkdir -p "${app_merged}${dst}"
+                fi
+            fi
+        done
+        IFS="$bp_old_ifs"
+        if [ "$bp_had_noglob" -eq 0 ]; then
+            set +f
+        fi
+    }
+
+    NEED_SETUID_CAPS=0
+
+    ensure_stage1_numeric_gid() {
+        gid_num="$1"
+        [ -n "$gid_num" ] || return 0
+        NEED_SETUID_CAPS=1
+        if ! awk -F: -v id="$gid_num" '$3 == id {found=1} END {exit !found}' "${STAGE1_ROOT}/etc/group"; then
+            printf 'pod-gid-%s:x:%s:\n' "$gid_num" "$gid_num" >> "${STAGE1_ROOT}/etc/group"
+        fi
+    }
+
+    ensure_stage1_numeric_uid() {
+        uid_num="$1"
+        gid_num="$2"
+        home_dir="${3:-/nonexistent}"
+        [ -n "$uid_num" ] || return 0
+        [ -n "$gid_num" ] || gid_num="$uid_num"
+        [ -n "$home_dir" ] || home_dir="/nonexistent"
+        NEED_SETUID_CAPS=1
+        ensure_stage1_numeric_gid "$gid_num"
+        if ! awk -F: -v id="$uid_num" '$3 == id {found=1} END {exit !found}' "${STAGE1_ROOT}/etc/passwd"; then
+            printf 'pod-uid-%s:x:%s:%s::%s:/usr/sbin/nologin\n' "$uid_num" "$uid_num" "$gid_num" "$home_dir" >> "${STAGE1_ROOT}/etc/passwd"
+        fi
+    }
+
+    resolve_stage2_gid() {
+        g_spec="$1"
+        s2_root="$2"
+        case "$g_spec" in
+            "")
+                return 1
+                ;;
+            *[!0-9]*)
+                if [ -f "${s2_root}/etc/group" ]; then
+                    g_num="$(awk -F: -v n="$g_spec" '$1 == n {print $3; exit}' "${s2_root}/etc/group")"
+                    if [ -n "$g_num" ]; then
+                        printf '%s' "$g_num"
+                        return 0
+                    fi
+                fi
+                return 1
+                ;;
+            *)
+                printf '%s' "$g_spec"
+                return 0
+                ;;
+        esac
+    }
+
+    ensure_stage1_shell_alias() {
+        alias_name="$1"
+        [ -n "$alias_name" ] || return 0
+        existing_uid="$(awk -F: -v n="$alias_name" '$1 == n {print $3; exit}' "${STAGE1_ROOT}/etc/passwd")"
+        if [ -n "$existing_uid" ]; then
+            if [ "$existing_uid" != "0" ]; then
+                echo "Shell alias '${alias_name}' collides with non-root user (uid=${existing_uid}) in Stage 1 /etc/passwd" >&2
+                return 1
+            fi
+            return 0
+        fi
+        printf '%s:x:0:0:Pod layer %s:/root:/bin/bash\n' "$alias_name" "$alias_name" >> "${STAGE1_ROOT}/etc/passwd"
+        if [ -f "${STAGE1_ROOT}/etc/shadow" ]; then
+            printf '%s:*:19000:0:99999:7:::\n' "$alias_name" >> "${STAGE1_ROOT}/etc/shadow"
+        fi
+    }
+
+    sync_stage2_app_identity() {
+        s2_dropin_dir="$1"
+        s2_root="$2"
+        s2_app_id="$3"
+        s2_img="$4"
+
+        eff_user=""
+        eff_group=""
+        eff_sup=""
+        has_sup_directive=0
+
+        for id_cfg in "${s2_dropin_dir}/10-image.conf" "${s2_dropin_dir}/20-credential.conf"; do
+            [ -f "$id_cfg" ] || continue
+            while IFS= read -r cfg_line || [ -n "$cfg_line" ]; do
+                case "$cfg_line" in
+                    User=*)
+                        eff_user="${cfg_line#User=}"
+                        ;;
+                    Group=*)
+                        eff_group="${cfg_line#Group=}"
+                        ;;
+                    SupplementaryGroups=*)
+                        has_sup_directive=1
+                        sup_val="${cfg_line#SupplementaryGroups=}"
+                        if [ -z "$sup_val" ]; then
+                            eff_sup=""
+                        else
+                            eff_sup="${eff_sup:+${eff_sup} }${sup_val}"
+                        fi
+                        ;;
+                esac
+            done < "$id_cfg"
+        done
+
+        resolved_uid=""
+        resolved_gid=""
+        u_name=""
+        u_gid=""
+        u_home=""
+
+        if [ -n "$eff_user" ] && [ "$eff_user" != "0" ] && [ "$eff_user" != "root" ]; then
+            case "$eff_user" in
+                *[!0-9]*)
+                    if [ ! -f "${s2_root}/etc/passwd" ]; then
+                        echo "User '${eff_user}' for app '${s2_app_id}' cannot be resolved: ${s2_img} has no /etc/passwd" >&2
+                        return 1
+                    fi
+                    u_line="$(awk -F: -v n="$eff_user" '$1 == n {print; exit}' "${s2_root}/etc/passwd")"
+                    if [ -z "$u_line" ]; then
+                        echo "User '${eff_user}' for app '${s2_app_id}' not found in ${s2_img} /etc/passwd" >&2
+                        return 1
+                    fi
+                    u_name="$(printf '%s' "$u_line" | cut -d: -f1)"
+                    resolved_uid="$(printf '%s' "$u_line" | cut -d: -f3)"
+                    u_gid="$(printf '%s' "$u_line" | cut -d: -f4)"
+                    u_home="$(printf '%s' "$u_line" | cut -d: -f6)"
+                    ;;
+                *)
+                    resolved_uid="$eff_user"
+                    u_gid="$eff_user"
+                    if [ -f "${s2_root}/etc/passwd" ]; then
+                        u_line="$(awk -F: -v id="$eff_user" '$3 == id {print; exit}' "${s2_root}/etc/passwd")"
+                        if [ -n "$u_line" ]; then
+                            u_name="$(printf '%s' "$u_line" | cut -d: -f1)"
+                            u_gid="$(printf '%s' "$u_line" | cut -d: -f4)"
+                            u_home="$(printf '%s' "$u_line" | cut -d: -f6)"
+                        fi
+                    fi
+                    ;;
+            esac
+            ensure_stage1_numeric_uid "$resolved_uid" "$u_gid" "${u_home:-/nonexistent}"
+        fi
+
+        if [ -n "$eff_group" ]; then
+            if [ "$eff_group" = "0" ] || [ "$eff_group" = "root" ]; then
+                resolved_gid="0"
+            else
+                resolved_gid="$(resolve_stage2_gid "$eff_group" "$s2_root")" || {
+                    echo "Group '${eff_group}' for app '${s2_app_id}' not found in ${s2_img} /etc/group" >&2
+                    return 1
+                }
+                ensure_stage1_numeric_gid "$resolved_gid"
+            fi
+        elif [ -n "$u_gid" ]; then
+            resolved_gid="$u_gid"
+        fi
+
+        resolved_sup_gids=""
+        if [ -n "$u_name" ] && [ -f "${s2_root}/etc/group" ]; then
+            member_gids="$(awk -F: -v u="$u_name" '{
+                n = split($4, members, ",")
+                for (i = 1; i <= n; i++) {
+                    if (members[i] == u) {
+                        print $3
+                        break
+                    }
+                }
+            }' "${s2_root}/etc/group")"
+            for mg in $member_gids; do
+                [ -n "$mg" ] || continue
+                ensure_stage1_numeric_gid "$mg"
+                case " ${resolved_sup_gids} " in
+                    *" ${mg} "*) ;;
+                    *) resolved_sup_gids="${resolved_sup_gids:+${resolved_sup_gids} }${mg}" ;;
+                esac
+            done
+        fi
+
+        if [ -n "$eff_sup" ]; then
+            sg_old_ifs="$IFS"
+            case "$-" in
+                *f*) sg_had_noglob=1 ;;
+                *)   sg_had_noglob=0; set -f ;;
+            esac
+            IFS=' '
+            for sg in $eff_sup; do
+                sg_num="$(resolve_stage2_gid "$sg" "$s2_root")" || {
+                    echo "SupplementaryGroup '${sg}' for app '${s2_app_id}' not found in ${s2_img} /etc/group" >&2
+                    IFS="$sg_old_ifs"
+                    if [ "$sg_had_noglob" -eq 0 ]; then
+                        set +f
+                    fi
+                    return 1
+                }
+                ensure_stage1_numeric_gid "$sg_num"
+                case " ${resolved_sup_gids} " in
+                    *" ${sg_num} "*) ;;
+                    *) resolved_sup_gids="${resolved_sup_gids:+${resolved_sup_gids} }${sg_num}" ;;
+                esac
+            done
+            IFS="$sg_old_ifs"
+            if [ "$sg_had_noglob" -eq 0 ]; then
+                set +f
+            fi
+        fi
+
+        if [ -n "$u_name" ] || [ -n "$u_home" ]; then
+            {
+                printf '[Service]\n'
+                if [ -n "$u_name" ]; then
+                    printf 'Environment="USER=%s" "LOGNAME=%s"\n' "$u_name" "$u_name"
+                fi
+                if [ -n "$u_home" ]; then
+                    printf 'Environment="HOME=%s"\n' "$u_home"
+                fi
+            } > "${s2_dropin_dir}/05-identity-env.conf"
+        fi
+
+        if [ -n "$resolved_uid" ] || [ -n "$resolved_gid" ] || [ -n "$resolved_sup_gids" ] || [ "$has_sup_directive" -eq 1 ]; then
+            {
+                printf '[Service]\n'
+                if [ -n "$resolved_uid" ]; then
+                    printf 'User=%s\n' "$resolved_uid"
+                fi
+                if [ -n "$resolved_gid" ]; then
+                    printf 'Group=%s\n' "$resolved_gid"
+                fi
+                if [ -n "$resolved_sup_gids" ] || [ "$has_sup_directive" -eq 1 ]; then
+                    printf 'SupplementaryGroups=\n'
+                    if [ -n "$resolved_sup_gids" ]; then
+                        printf 'SupplementaryGroups=%s\n' "$resolved_sup_gids"
+                    fi
+                fi
+            } > "${s2_dropin_dir}/30-identity.conf"
+        fi
+    }
+
+    # 6. Mount each Stage 2 application overlay and emit its Stage 1 systemd unit
+    NSPAWN_APP_BINDS=""
+    UNIT_DIR="${STAGE1_ROOT}/etc/systemd/system"
+    mkdir -p "${STAGE1_ROOT}/opt/stage2" "${RUN_DIR}/app-rootfs" "${RUN_DIR}/app-upper" "${RUN_DIR}/app-work" \
+             "${UNIT_DIR}/pod-idle.target.wants" "${UNIT_DIR}/pod-stdio@.service.d"
+    {
+        printf '[Service]\n'
+        printf 'LogExtraFields=POD_UNIT=%s\n' "${MACHINE_NAME}"
+    } > "${UNIT_DIR}/pod-stdio@.service.d/10-pod-unit.conf"
+
+    ensure_stage1_shell_alias "stage1"
+
+    for cred in "${CRED_DIR}"/pod.app.*; do
+        if [ ! -f "$cred" ]; then
+            continue
+        fi
+        app_id="${cred##*pod.app.}"
+        spec="$(tr -d '\r\n' < "$cred")"
+        case "$spec" in
+            *=*)
+                img_name="$(read_kv image "$spec" || true)"
+                ;;
+            *)
+                img_name="$(printf '%s' "$spec" | tr -d ' \t')"
+                ;;
+        esac
+
+        if [ -z "$img_name" ]; then
+            echo "Missing image name in ${cred}" >&2
+            exit 1
+        fi
+
+        img_link="/var/lib/machines/${img_name}"
+        if [ ! -d "$img_link" ]; then
+            echo "Stage 2 image ${img_name} not found in /var/lib/machines" >&2
+            exit 1
+        fi
+        img_dir="$(readlink -f "$img_link")"
+
+        app_merged="${RUN_DIR}/app-rootfs/${app_id}"
+        app_upper="${RUN_DIR}/app-upper/${app_id}"
+        app_work="${RUN_DIR}/app-work/${app_id}"
+        app_target="/opt/stage2/${app_id}/rootfs"
+
+        mkdir -p "${app_merged}" "${app_upper}" "${app_work}" "${STAGE1_ROOT}${app_target}"
+        printf '%s\n' "${img_name}" > "${STAGE1_ROOT}/opt/stage2/${app_id}/image"
+        if has_xattr user.pod.version "${img_dir}"; then
+            read_xattr user.pod.version "${img_dir}" > "${STAGE1_ROOT}/opt/stage2/${app_id}/version"
+            printf '\n' >> "${STAGE1_ROOT}/opt/stage2/${app_id}/version"
+        else
+            printf '%s\n' "${img_dir##*/}" > "${STAGE1_ROOT}/opt/stage2/${app_id}/version"
+        fi
+
+        mount -t overlay overlay \
+            -o "lowerdir=${img_dir},upperdir=${app_upper},workdir=${app_work}" \
+            "${app_merged}"
+
+        mkdir -p "${app_merged}/etc" "${app_merged}/proc" "${app_merged}/sys" "${app_merged}/dev" "${app_merged}/run" "${app_merged}/tmp"
+        chmod 1777 "${app_merged}/tmp"
+        rm -f "${app_merged}/etc/resolv.conf" "${app_merged}/etc/hostname"
+        cp "${STAGE1_ROOT}/etc/resolv.conf" "${app_merged}/etc/resolv.conf"
+        cp "${STAGE1_ROOT}/etc/hostname" "${app_merged}/etc/hostname"
+
+        dropin_dir="${UNIT_DIR}/${app_id}.service.d"
+        mkdir -p "${dropin_dir}"
+
+        # Layer 10: Stage 2 image defaults from user.pod.unit xattr (or legacy /etc/pod.service)
+        if has_xattr user.pod.unit "${img_dir}"; then
+            read_xattr user.pod.unit "${img_dir}" > "${dropin_dir}/10-image.conf"
+        elif [ -f "${img_dir}/etc/pod.service" ]; then
+            cp "${img_dir}/etc/pod.service" "${dropin_dir}/10-image.conf"
+        fi
+
+        # Materialise user.pod.env xattr inside Stage 1 (or fall back to legacy Stage 2 /etc/pod-environment)
+        env_file_directive="EnvironmentFile=-${app_target}/etc/pod-environment"
+        if has_xattr user.pod.env "${img_dir}"; then
+            read_xattr user.pod.env "${img_dir}" > "${UNIT_DIR}/${app_id}.env"
+            chmod 0644 "${UNIT_DIR}/${app_id}.env"
+            env_file_directive="EnvironmentFile=-/etc/systemd/system/${app_id}.env"
+        fi
+
+        unit_lines=""
+        svc_lines=""
+        has_exec_override=0
+        nl='
+'
+
+        case "$spec" in
+            *=*)
+                old_ifs="$IFS"
+                set -f
+                IFS=','
+                for pair in $spec; do
+                    k="${pair%%=*}"
+                    v="${pair#*=}"
+                    case "$k" in
+                        image)
+                            ;;
+                        Description|Documentation|After|Before|Wants|Requires|Requisite|BindsTo|PartOf|Upholds|Conflicts|OnFailure|OnSuccess|PropagatesReloadTo|ReloadPropagatedFrom|PropagatesStopTo|StopPropagatedFrom|JoinsNamespaceOf|StartLimitIntervalSec|StartLimitBurst|StartLimitAction|Condition*|Assert*)
+                            unit_lines="${unit_lines}${k}=${v}${nl}"
+                            ;;
+                        ExecStart)
+                            if [ "$has_exec_override" -eq 0 ]; then
+                                svc_lines="${svc_lines}ExecStart=${nl}"
+                                has_exec_override=1
+                            fi
+                            svc_lines="${svc_lines}ExecStart=${v}${nl}"
+                            ;;
+                        BindPaths|BindReadOnlyPaths)
+                            prepare_bind_mountpoints "$v"
+                            svc_lines="${svc_lines}${k}=${v}${nl}"
+                            ;;
+                        *)
+                            svc_lines="${svc_lines}${k}=${v}${nl}"
+                            ;;
+                    esac
+                done
+                IFS="$old_ifs"
+                set +f
+                ;;
+        esac
+
+        # Ensure mountpoints for any BindPaths/BindReadOnlyPaths declared in 10-image.conf
+        if [ -f "${dropin_dir}/10-image.conf" ]; then
+            while IFS= read -r line || [ -n "$line" ]; do
+                case "$line" in
+                    BindPaths=*|BindReadOnlyPaths=*)
+                        prepare_bind_mountpoints "${line#*=}"
+                        ;;
+                esac
+            done < "${dropin_dir}/10-image.conf"
+        fi
+
+        has_image_exec=0
+        if [ -f "${dropin_dir}/10-image.conf" ] && grep -q '^[[:space:]]*ExecStart=' "${dropin_dir}/10-image.conf"; then
+            has_image_exec=1
+        fi
+        if [ "$has_exec_override" -eq 0 ] && [ "$has_image_exec" -eq 0 ]; then
+            echo "No ExecStart= in ${cred} and no user.pod.unit or /etc/pod.service with ExecStart= in ${img_dir}" >&2
+            exit 1
+        fi
+
+        # Base unit: runtime defaults (overridable by 10-image.conf and 20-credential.conf)
+        {
+            printf '[Unit]\n'
+            printf 'Description=Pod Stage 2 Application %s (%s)\n' "${app_id}" "${img_name}"
+            printf 'Wants=pod-stage2-post@%s.service\n' "${app_id}"
+            cat <<'EOF'
+DefaultDependencies=no
+After=systemd-journald.socket systemd-journald-dev-log.socket dbus.socket
+Before=pod-idle.target shutdown.target
+Conflicts=shutdown.target
+
+[Service]
+Type=exec
+NotifyAccess=all
+Restart=always
+RestartSec=2s
+TimeoutStartSec=30s
+MountAPIVFS=yes
+ProtectHostname=yes
+EOF
+            printf 'LogExtraFields=POD_UNIT=%s\n' "${MACHINE_NAME}"
+            printf 'RootDirectory=%s\n' "${app_target}"
+            printf '%s\n' "${env_file_directive}"
+        } > "${UNIT_DIR}/${app_id}.service"
+
+        # Layer 20: Per-pod credential overrides from SetCredential=pod.app.<app_id>
+        if [ -n "$unit_lines" ] || [ -n "$svc_lines" ]; then
+            {
+                if [ -n "$unit_lines" ]; then
+                    printf '[Unit]\n%s' "${unit_lines}"
+                fi
+                if [ -n "$svc_lines" ]; then
+                    printf '[Service]\n%s' "${svc_lines}"
+                fi
+            } > "${dropin_dir}/20-credential.conf"
+        fi
+
+        # Layers 05 and 30: Resolve symbolic/numeric Stage 2 identities to hidden numeric
+        # Stage 1 accounts so Stage 2 app names remain free for UID 0 shell aliases.
+        sync_stage2_app_identity "${dropin_dir}" "${app_merged}" "${app_id}" "${img_name}"
+        ensure_stage1_shell_alias "${app_id}"
+
+        ln -sf "../${app_id}.service" "${UNIT_DIR}/pod-idle.target.wants/${app_id}.service"
+
+        NSPAWN_APP_BINDS="${NSPAWN_APP_BINDS} --bind=${app_merged}:${app_target}"
+    done
+
+    # 7. Wire journal directory bindings for journalctl -M and journalctl -m
+    NSPAWN_JOURNAL_BINDS=""
+
+    nsenter --mount=/proc/1/ns/mnt -- mkdir -p "/run/log/journal/${HOST_MACHINE_ID}.${MACHINE_NAME}"
+    nsenter --mount=/proc/1/ns/mnt -- ln -sfn "${HOST_MACHINE_ID}.${MACHINE_NAME}" "/run/log/journal/${POD_MACHINE_ID}"
+    mkdir -p "${STAGE1_ROOT}/run/log/journal/${POD_MACHINE_ID}"
+    NSPAWN_JOURNAL_BINDS="--bind=/run/log/journal/${HOST_MACHINE_ID}.${MACHINE_NAME}:/run/log/journal/${POD_MACHINE_ID}"
+
+    if [ -d /var/log/journal ]; then
+        nsenter --mount=/proc/1/ns/mnt -- mkdir -p "/var/log/journal/${HOST_MACHINE_ID}.${MACHINE_NAME}"
+        nsenter --mount=/proc/1/ns/mnt -- ln -sfn "${HOST_MACHINE_ID}.${MACHINE_NAME}" "/var/log/journal/${POD_MACHINE_ID}"
+        mkdir -p "${STAGE1_ROOT}/var/log/journal/${POD_MACHINE_ID}"
+        NSPAWN_JOURNAL_BINDS="${NSPAWN_JOURNAL_BINDS} --bind=/var/log/journal/${HOST_MACHINE_ID}.${MACHINE_NAME}:/var/log/journal/${POD_MACHINE_ID}"
+    fi
+
+    # 8. Resolve Stage 1 capabilities and disable image lock / seccomp filtering
+    POD_CAPS="CAP_NET_RAW,CAP_NET_ADMIN,CAP_NET_BIND_SERVICE,CAP_SYS_ADMIN"
+    if [ -f "${CRED_DIR}/pod.caps" ]; then
+        custom_caps="$(tr -d ' \t\r\n' < "${CRED_DIR}/pod.caps")"
+        if [ -n "$custom_caps" ]; then
+            case ",${custom_caps}," in
+                *,CAP_SYS_ADMIN,*)
+                    POD_CAPS="$custom_caps"
+                    ;;
+                *)
+                    POD_CAPS="${custom_caps},CAP_SYS_ADMIN"
+                    ;;
+            esac
+        fi
+    fi
+
+    if [ "$NEED_SETUID_CAPS" -eq 1 ]; then
+        for req_cap in CAP_SETUID CAP_SETGID; do
+            case ",${POD_CAPS}," in
+                *,"${req_cap}",*) ;;
+                *) POD_CAPS="${POD_CAPS},${req_cap}" ;;
+            esac
+        done
+    fi
+
+    export SYSTEMD_NSPAWN_LOCK=0
+    export SYSTEMD_NSPAWN_SECCOMP=0
+
+    # Clear any stale systemd-machined entry left by systemctl restart or Restart=always
+    unregister_stale_machine "${MACHINE_NAME}"
+
+    # 9. Execute systemd-nspawn with Stage 2 app rootfs bind mounts and configured capabilities
+    # shellcheck disable=SC2086
+    exec /usr/bin/systemd-nspawn \
+        --quiet \
+        --keep-unit \
+        --boot \
+        --notify-ready=yes \
+        --register=yes \
+        --link-journal=no \
+        --capability="${POD_CAPS}" \
+        --machine="${MACHINE_NAME}" \
+        --hostname="${POD_HOSTNAME}" \
+        --uuid="${POD_MACHINE_ID}" \
+        --directory="${STAGE1_ROOT}" \
+        --bind="${RUN_DIR}/vol:/vol" \
+        $NSPAWN_APP_BINDS \
+        $NSPAWN_HOST_BINDS \
+        $NSPAWN_JOURNAL_BINDS
+}
+
+case "${1:-}" in
+    start) cmd_start ;;
+    stop)  cmd_stop ;;
+    *)     usage ;;
+esac

@@ -2,15 +2,16 @@
 set -eu
 
 usage() {
-    cat <<'EOF' >&2
+    cat >&2 <<'EOF'
 Usage: pod-import-oci <oci-or-docker-ref> <stage2-image-name> [options]
 
 Options:
-  --arch=<arch>           Override target CPU architecture (for example amd64, 386, arm64)
+  --arch=<arch>           Override target architecture (for example amd64, arm64, 386)
   --os=<os>               Override target OS (default: linux)
-  --variant=<variant>     Override architecture variant (for example v7)
+  --variant=<variant>     Override target architecture variant
   --creds=<user:pass>     Registry credentials passed to skopeo --src-creds
-  --tls-verify=<bool>     Verify TLS certificates (true or false)
+  --tls-verify=<bool>     Passed to skopeo --src-tls-verify (true or false)
+  --version=<ver>         Override sealed version tag (default: 16-char OCI config digest)
 
 Example:
   pod-import-oci docker://docker.io/library/redis:7-alpine redis-alpine
@@ -27,23 +28,20 @@ IMG_NAME="$2"
 shift 2
 
 case "$IMG_NAME" in
-    ""|*/*|*..*|.*|-*)
-        echo "Invalid stage 2 image name: ${IMG_NAME}" >&2
+    ""|.*|*/*|*..*|*[[:space:]]*)
+        echo "Invalid image name: ${IMG_NAME}" >&2
         exit 1
         ;;
 esac
-if ! printf '%s' "$IMG_NAME" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$'; then
-    echo "Invalid stage 2 image name: ${IMG_NAME} (allowed: A-Z, a-z, 0-9, ., _, -; max 64 chars)" >&2
-    exit 1
-fi
 
-for cmd in skopeo umoci jq machinectl; do
+for cmd in skopeo umoci jq setfattr; do
     if ! command -v "$cmd" >/dev/null 2>&1; then
         echo "Missing required tool: ${cmd}" >&2
         exit 1
     fi
 done
 
+VERSION_OVERRIDE=""
 n="$#"
 while [ "$n" -gt 0 ]; do
     arg="$1"
@@ -55,24 +53,13 @@ while [ "$n" -gt 0 ]; do
         --variant=*)    set -- "$@" "--override-variant=${arg#*=}" ;;
         --creds=*)      set -- "$@" "--src-creds=${arg#*=}" ;;
         --tls-verify=*) set -- "$@" "--src-tls-verify=${arg#*=}" ;;
+        --version=*)    VERSION_OVERRIDE="${arg#*=}" ;;
         *)              echo "Unknown option: ${arg}" >&2; usage ;;
     esac
 done
 
-TARGET_DIR="/var/lib/machines/${IMG_NAME}"
-
-check_lowerdir_not_in_use() {
-    escaped_target="$(printf '%s' "${TARGET_DIR}" | sed 's/[.[\*^$()+?{|]/\\&/g')"
-    if grep -qE "(^|,)lowerdir=([^ ,]*:)?${escaped_target}(:|,| |$)" /proc/[0-9]*/mountinfo 2>/dev/null; then
-        echo "Refusing to overwrite ${TARGET_DIR}: in use as an active OverlayFS lowerdir (use a new image version or stop pods using it first)" >&2
-        exit 1
-    fi
-}
-
-check_lowerdir_not_in_use
-
-mkdir -p /var/lib/machines
-TMP_DIR="$(mktemp -d "/var/lib/machines/.import-${IMG_NAME}.XXXXXX")"
+mkdir -p -m 0755 /var/lib/machines /var/lib/machines/.store
+TMP_DIR="$(mktemp -d "/var/lib/machines/.store/.import-${IMG_NAME}.XXXXXX")"
 
 cleanup() {
     rm -rf "${TMP_DIR}"
@@ -86,13 +73,12 @@ umoci unpack --image "${TMP_DIR}/oci:import" "${TMP_DIR}/bundle"
 ROOTFS="${TMP_DIR}/bundle/rootfs"
 BUNDLE_CFG="${TMP_DIR}/bundle/config.json"
 
-# 2. Write /etc/pod-environment with safe systemd EnvironmentFile= quoting
-mkdir -p "${ROOTFS}/etc"
+# 2. Write external pod-environment file (never mutating ROOTFS)
 jq -r '
     .process.env[]? // empty
     | capture("^(?<k>[^=]+)=(?<v>.*)$")
     | "\(.k)=\"\(.v | gsub("\\\\"; "\\\\") | gsub("\""; "\\\"") | gsub("\n"; "\\n") | gsub("\r"; "\\r"))\""
-' "${BUNDLE_CFG}" > "${ROOTFS}/etc/pod-environment"
+' "${BUNDLE_CFG}" > "${TMP_DIR}/pod-environment"
 
 # 3. Resolve argv[0] against the container PATH inside ROOTFS so systemd ExecStart= gets an absolute path
 IMG_PATH="$(jq -r '.process.env[]? | select(startswith("PATH=")) | sub("^PATH="; "")' "${BUNDLE_CFG}" | head -n 1)"
@@ -169,10 +155,7 @@ if [ -n "$STOP_SIG" ]; then
     esac
 fi
 
-# 5. Emit /etc/pod.service (loaded as 10-image.conf by pod-container-start)
-#    Use pod-stdio@%N.service FIFO bridge so OCI apps that open("/dev/stdout")
-#    or open("/dev/stderr") (such as nginx or httpd) do not hit ENXIO on a
-#    journald stream socket while still streaming all logs to journald.
+# 5. Emit external pod.service (stored in user.pod.unit xattr by pod-image-seal)
 {
     printf '[Unit]\n'
     printf 'Wants=pod-stdio@%%N.service\n'
@@ -195,22 +178,17 @@ fi
         printf 'KillSignal=%s\n' "${STOP_SIG}"
     fi
     printf 'ExecStart=%s\n' "${EXEC_START}"
-} > "${ROOTFS}/etc/pod.service"
+} > "${TMP_DIR}/pod.service"
 
-# 6. Atomically install into /var/lib/machines/<image> and mark read-only
-chmod 0755 "${ROOTFS}"
-check_lowerdir_not_in_use
-if [ -e "${TARGET_DIR}" ]; then
-    machinectl read-only "${IMG_NAME}" no 2>/dev/null || true
-    mv "${TARGET_DIR}" "${TMP_DIR}/old"
+if [ -n "$VERSION_OVERRIDE" ]; then
+    DIGEST="$VERSION_OVERRIDE"
+else
+    DIGEST="$(skopeo inspect --raw "oci:${TMP_DIR}/oci:import" | jq -r '.config.digest // empty | sub("^sha256:"; "") | .[0:16]')"
 fi
 
-if ! mv "${ROOTFS}" "${TARGET_DIR}"; then
-    if [ -e "${TMP_DIR}/old" ]; then
-        mv "${TMP_DIR}/old" "${TARGET_DIR}" 2>/dev/null || true
-    fi
-    exit 1
-fi
-
-machinectl read-only "${IMG_NAME}" yes
-echo "Imported ${SRC_REF} -> ${TARGET_DIR}"
+# 6. Seal via pod-image-seal (normal child call so trap cleanup removes TMP_DIR)
+/usr/lib/systemd/pod-image-seal "${ROOTFS}" "${IMG_NAME}" \
+    --unit-file="${TMP_DIR}/pod.service" \
+    --env-file="${TMP_DIR}/pod-environment" \
+    --version="${DIGEST}" \
+    --origin="${SRC_REF}"
